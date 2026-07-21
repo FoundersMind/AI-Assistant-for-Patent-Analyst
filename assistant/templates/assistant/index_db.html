@@ -780,6 +780,60 @@
         .panel-left{ border-right:0; border-bottom:1px solid var(--border); height:45%; }
         .panel-right{ height:55%; }
       }
+
+      .chart-toolbar{
+        display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+        padding:6px 10px;
+        border-bottom:1px solid var(--border);
+        background:var(--surface-2);
+      }
+      .chart-toolbar .form-control, .chart-toolbar .form-select{ font-size:11px; }
+      .chart-select{ min-width:140px; max-width:220px; }
+      .row-search{ min-width:120px; max-width:200px; flex:1 1 140px; }
+      .strength-filter{ display:flex; gap:4px; flex-wrap:wrap; }
+      .strength-filter .btn{
+        font-size:10px; font-weight:700; padding:2px 8px; border-radius:999px;
+      }
+      .strength-filter .btn.active{ box-shadow:0 0 0 2px rgba(37,99,235,.25); }
+      .health-summary{
+        display:flex; gap:6px; flex-wrap:wrap; margin-left:auto;
+        font-size:10px; font-weight:700;
+      }
+      .health-pill{
+        padding:2px 8px; border-radius:999px; border:1px solid transparent;
+        white-space:nowrap;
+      }
+      .health-pill.strong{ background:#ecfdf5; color:#166534; border-color:#a7f3d0; }
+      .health-pill.weak{ background:#fffbeb; color:#b45309; border-color:#fde68a; }
+      .health-pill.missing{ background:#fef2f2; color:#b91c1c; border-color:#fecaca; }
+      .pending-bar{
+        display:flex; align-items:center; justify-content:space-between; gap:10px;
+        padding:6px 10px;
+        background:linear-gradient(90deg, #eff6ff, #f5f3ff);
+        border-bottom:1px solid #bfdbfe;
+        font-size:11px; font-weight:600; color:#1e3a5f;
+      }
+      .pending-bar-actions{ display:flex; gap:6px; flex-shrink:0; }
+      .doc-extract-badge{
+        font-size:9px; font-weight:700; padding:1px 5px; border-radius:4px;
+        margin-left:4px;
+      }
+      .doc-extract-badge.ok{ background:#ecfdf5; color:#166534; }
+      .doc-extract-badge.warn{ background:#fff7ed; color:#c2410c; }
+      .doc-extract-badge.err{ background:#fef2f2; color:#b91c1c; }
+      .doc-preview-body{
+        max-height:50vh; overflow:auto;
+        font-size:12px; line-height:1.5;
+        white-space:pre-wrap; word-break:break-word;
+        background:#f8fafc; border:1px solid var(--border); border-radius:8px;
+        padding:10px;
+      }
+      .shortcut-table{ font-size:12px; }
+      .shortcut-table kbd{
+        font-size:11px; padding:2px 6px; border-radius:4px;
+        background:#f1f5f9; border:1px solid #cbd5e1;
+      }
+      mark.search-hit{ background:#fef08a; padding:0 1px; border-radius:2px; }
     </style>
   </head>
   <body>
@@ -792,9 +846,14 @@
           </div>
           <div class="app-header-tagline d-none d-xl-block">Patent claim-chart analyst workbench</div>
         </div>
-        <button class="btn btn-outline-secondary btn-sm border-secondary-subtle" data-bs-toggle="modal" data-bs-target="#exportModal" title="Export current chart to Word">
-          <i class="bi bi-file-earmark-word me-1"></i> Export Word
-        </button>
+        <div class="d-flex align-items-center gap-2">
+          <button class="btn btn-outline-secondary btn-sm border-secondary-subtle" type="button" data-bs-toggle="modal" data-bs-target="#shortcutsModal" title="Keyboard shortcuts">
+            <i class="bi bi-keyboard"></i>
+          </button>
+          <button class="btn btn-outline-secondary btn-sm border-secondary-subtle" data-bs-toggle="modal" data-bs-target="#exportModal" title="Export current chart">
+            <i class="bi bi-download me-1"></i> Export
+          </button>
+        </div>
       </div>
     </header>
 
@@ -821,6 +880,9 @@
               <button type="button" id="redoChartBtn" class="btn btn-outline-secondary btn-sm" disabled title="Redo last undone change">
                 <i class="bi bi-arrow-clockwise"></i><span class="d-none d-md-inline"> Redo</span>
               </button>
+              <button type="button" id="reassessStrengthsBtn" class="btn btn-outline-secondary btn-sm" disabled title="Re-run AI strength assessment on all rows">
+                <i class="bi bi-speedometer2"></i><span class="d-none d-lg-inline"> Assess</span>
+              </button>
               <div class="btn-group btn-group-sm" role="group" aria-label="Table density">
                 <button type="button" class="btn btn-outline-secondary active" id="densityCompactBtn" title="Compact table density">Dense</button>
                 <button type="button" class="btn btn-outline-secondary" id="densityComfortBtn" title="Comfortable table density">Wide</button>
@@ -830,6 +892,26 @@
               </button>
             </div>
             <span id="caseSelectHelp" class="visually-hidden">Choose the matter whose claim charts and documents load in this workspace.</span>
+          </div>
+        </div>
+        <div class="chart-toolbar" id="chartToolbar">
+          <select id="chartSelect" class="form-select form-select-sm chart-select" aria-label="Active claim chart" disabled>
+            <option value="">No chart loaded</option>
+          </select>
+          <input type="search" id="rowSearchInput" class="form-control form-control-sm row-search" placeholder="Search rows…" disabled aria-label="Search claim chart rows" />
+          <div class="strength-filter" role="group" aria-label="Filter by strength">
+            <button type="button" class="btn btn-outline-secondary btn-sm active" data-strength-filter="all">All</button>
+            <button type="button" class="btn btn-outline-secondary btn-sm" data-strength-filter="weak">Weak</button>
+            <button type="button" class="btn btn-outline-secondary btn-sm" data-strength-filter="missing">Missing</button>
+            <button type="button" class="btn btn-outline-secondary btn-sm" data-strength-filter="strong">Strong</button>
+          </div>
+          <div id="healthSummary" class="health-summary" aria-live="polite"></div>
+        </div>
+        <div id="pendingBar" class="pending-bar d-none" role="status">
+          <span id="pendingBarText">0 AI suggestions pending</span>
+          <div class="pending-bar-actions">
+            <button type="button" id="acceptAllBtn" class="btn btn-success btn-sm"><i class="bi bi-check2-all me-1"></i>Accept all</button>
+            <button type="button" id="rejectAllBtn" class="btn btn-outline-secondary btn-sm"><i class="bi bi-x-lg me-1"></i>Reject all</button>
           </div>
         </div>
         <div class="collapse border-bottom" id="changeHistoryCollapse">
@@ -1137,15 +1219,86 @@
       <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
           <div class="modal-header">
-            <h5 class="modal-title">Export Claim Chart</h5>
+            <h5 class="modal-title">Export claim chart</h5>
             <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
           </div>
           <div class="modal-body">
-            Downloads the <strong>saved</strong> chart for the case (all rows in the database). Accept any AI “proposed” rows in the grid first so they are included.
+            <p class="small text-muted mb-3">Downloads the <strong>saved</strong> chart (accepted rows only). Accept any pending AI suggestions first.</p>
+            <label class="form-label small fw-semibold" for="exportFormatSelect">Format</label>
+            <select id="exportFormatSelect" class="form-select form-select-sm">
+              <option value="docx">Word (.docx) — includes strength &amp; origin</option>
+              <option value="xlsx">Excel (.xlsx) — round-trip friendly</option>
+              <option value="csv">CSV (.csv) — universal</option>
+            </select>
           </div>
           <div class="modal-footer">
             <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
-            <button type="button" class="btn btn-primary" id="exportDownloadBtn">Download .docx</button>
+            <button type="button" class="btn btn-primary" id="exportDownloadBtn"><i class="bi bi-download me-1"></i>Download</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Doc preview modal -->
+    <div class="modal fade" id="docPreviewModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+          <div class="modal-header py-2">
+            <h5 class="modal-title" id="docPreviewTitle">Document preview</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <div id="docPreviewMeta" class="small text-muted mb-2"></div>
+            <div id="docPreviewBody" class="doc-preview-body">Loading…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Keyboard shortcuts -->
+    <div class="modal fade" id="shortcutsModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+          <div class="modal-header py-2">
+            <h5 class="modal-title">Keyboard shortcuts</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <table class="table table-sm shortcut-table mb-0">
+              <tbody>
+                <tr><td><kbd>Ctrl</kbd> + <kbd>Enter</kbd></td><td>Send chat message</td></tr>
+                <tr><td><kbd>Ctrl</kbd> + <kbd>Z</kbd></td><td>Undo last accepted change</td></tr>
+                <tr><td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>Z</kbd></td><td>Redo</td></tr>
+                <tr><td><kbd>Ctrl</kbd> + <kbd>F</kbd></td><td>Focus row search</td></tr>
+                <tr><td><kbd>A</kbd></td><td>Accept all pending suggestions</td></tr>
+                <tr><td><kbd>Esc</kbd></td><td>Reject all pending suggestions</td></tr>
+                <tr><td><kbd>?</kbd></td><td>Show this help</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Welcome / tips (first visit) -->
+    <div class="modal fade" id="welcomeModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+          <div class="modal-header py-2 border-0">
+            <h5 class="modal-title"><span aria-hidden="true">✨</span> Welcome to Lumenci Spark</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body pt-0">
+            <ol class="small mb-0 ps-3">
+              <li class="mb-2"><strong>Create a matter</strong> and upload a claim chart with <strong>+</strong>.</li>
+              <li class="mb-2"><strong>Attach technical docs</strong> under Docs for richer AI context.</li>
+              <li class="mb-2">Ask Spark to <strong>strengthen weak rows</strong> — review before/after cards.</li>
+              <li class="mb-2"><strong>Accept or reject</strong> in chat or the chart grid (use <strong>Accept all</strong> for batches).</li>
+              <li><strong>Export</strong> to Word, Excel, or CSV when ready.</li>
+            </ol>
+          </div>
+          <div class="modal-footer py-2 border-0">
+            <button type="button" class="btn btn-primary btn-sm" data-bs-dismiss="modal">Get started</button>
           </div>
         </div>
       </div>
@@ -1165,6 +1318,9 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
       (() => {
+        const LS_KEY = "lumenci_workspace_v1";
+        const WELCOME_KEY = "lumenci_welcome_seen_v1";
+
         const state = { cases: [], activeCaseId: null, activeChartId: null, activeChart: null };
         const ui = {
           activeRowId: null,
@@ -1172,6 +1328,8 @@
           pendingNewRows: [],
           typingTimer: null,
           tableDensity: "compact",
+          strengthFilter: "all",
+          rowSearchQuery: "",
           pendingDocChartId: null,
           pendingUrlChartId: null,
         };
@@ -1227,6 +1385,20 @@
           rowEditDeleteBtn: document.getElementById("rowEditDeleteBtn"),
           exportModal: document.getElementById("exportModal"),
           exportDownloadBtn: document.getElementById("exportDownloadBtn"),
+          exportFormatSelect: document.getElementById("exportFormatSelect"),
+          chartSelect: document.getElementById("chartSelect"),
+          rowSearchInput: document.getElementById("rowSearchInput"),
+          healthSummary: document.getElementById("healthSummary"),
+          pendingBar: document.getElementById("pendingBar"),
+          pendingBarText: document.getElementById("pendingBarText"),
+          acceptAllBtn: document.getElementById("acceptAllBtn"),
+          rejectAllBtn: document.getElementById("rejectAllBtn"),
+          reassessStrengthsBtn: document.getElementById("reassessStrengthsBtn"),
+          docPreviewModal: document.getElementById("docPreviewModal"),
+          docPreviewTitle: document.getElementById("docPreviewTitle"),
+          docPreviewMeta: document.getElementById("docPreviewMeta"),
+          docPreviewBody: document.getElementById("docPreviewBody"),
+          welcomeModal: document.getElementById("welcomeModal"),
         };
 
         const rowEditModalBs = () => bootstrap.Modal.getOrCreateInstance(el.rowEditModal);
@@ -1307,7 +1479,14 @@
               `</div>`
             );
           });
-          return `<div class="lumenci-suggestion-stack">${cards.join("")}</div>`;
+          return `<div class="lumenci-suggestion-stack">${cards.join("")}` +
+            (suggestions.length > 1
+              ? `<div class="suggestion-card-foot suggestion-card-actions mt-1">` +
+                `<button type="button" class="btn btn-success btn-sm" data-action="chat-accept-all"><i class="bi bi-check2-all me-1"></i>Accept all (${suggestions.length})</button>` +
+                `<button type="button" class="btn btn-outline-secondary btn-sm" data-action="chat-reject-all"><i class="bi bi-x-lg me-1"></i>Reject all</button>` +
+                `</div>`
+              : "") +
+            `</div>`;
         }
 
         function parseEmbeddedSuggestions(raw) {
@@ -1341,6 +1520,143 @@
           }
           if (tail) parts.push(`<div class="chat-prose">${formatChatProse(tail)}</div>`);
           return `<div class="content">${parts.join("")}</div>`;
+        }
+
+        function saveWorkspacePrefs() {
+          try {
+            localStorage.setItem(
+              LS_KEY,
+              JSON.stringify({
+                activeCaseId: state.activeCaseId,
+                activeChartId: state.activeChartId,
+                tableDensity: ui.tableDensity,
+                strengthFilter: ui.strengthFilter,
+              })
+            );
+          } catch (_) {}
+        }
+
+        function loadWorkspacePrefs() {
+          try {
+            const raw = localStorage.getItem(LS_KEY);
+            if (!raw) return null;
+            return JSON.parse(raw);
+          } catch {
+            return null;
+          }
+        }
+
+        function rowMatchesSearch(r, q) {
+          if (!q) return true;
+          const hay = `${r.claim || ""} ${r.evidence || ""} ${r.reasoning || ""}`.toLowerCase();
+          return hay.includes(q.toLowerCase());
+        }
+
+        function rowMatchesStrengthFilter(r) {
+          if (ui.strengthFilter === "all") return true;
+          return (r.strength || "weak") === ui.strengthFilter;
+        }
+
+        function highlightSearchText(text, q) {
+          const esc = escapeHtml(text || "");
+          if (!q) return esc;
+          const re = new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi");
+          return esc.replace(re, "<mark class=\"search-hit\">$1</mark>");
+        }
+
+        function computeStrengthCounts(rows) {
+          const counts = { strong: 0, weak: 0, missing: 0 };
+          (rows || []).forEach((r) => {
+            const s = r.strength || "weak";
+            if (counts[s] != null) counts[s] += 1;
+          });
+          return counts;
+        }
+
+        function renderHealthSummary() {
+          if (!el.healthSummary) return;
+          const rows = (state.activeChart && state.activeChart.rows) || [];
+          if (!rows.length) {
+            el.healthSummary.innerHTML = "";
+            return;
+          }
+          const c = computeStrengthCounts(rows);
+          el.healthSummary.innerHTML =
+            `<span class="health-pill strong" title="Strong evidence">${c.strong} strong</span>` +
+            `<span class="health-pill weak" title="Weak evidence">${c.weak} weak</span>` +
+            `<span class="health-pill missing" title="Missing evidence">${c.missing} missing</span>`;
+        }
+
+        function renderChartSelect() {
+          if (!el.chartSelect) return;
+          const c = getActiveCase();
+          el.chartSelect.innerHTML = "";
+          const charts = (c && c.claim_charts) || [];
+          if (!charts.length) {
+            const opt = document.createElement("option");
+            opt.value = "";
+            opt.textContent = "No charts — upload with +";
+            el.chartSelect.appendChild(opt);
+            el.chartSelect.disabled = true;
+            return;
+          }
+          charts.forEach((ch) => {
+            const opt = document.createElement("option");
+            opt.value = String(ch.id);
+            opt.textContent = ch.name;
+            el.chartSelect.appendChild(opt);
+          });
+          el.chartSelect.disabled = false;
+          if (state.activeChartId != null) el.chartSelect.value = String(state.activeChartId);
+        }
+
+        function syncToolbarEnabled() {
+          const on = Boolean(state.activeChartId);
+          if (el.rowSearchInput) el.rowSearchInput.disabled = !on;
+          if (el.reassessStrengthsBtn) el.reassessStrengthsBtn.disabled = !on;
+        }
+
+        function renderPendingBar() {
+          const n = ui.pendingSuggestions.length;
+          if (!el.pendingBar) return;
+          el.pendingBar.classList.toggle("d-none", n === 0);
+          if (el.pendingBarText) {
+            el.pendingBarText.textContent =
+              n === 1 ? "1 AI suggestion pending review" : `${n} AI suggestions pending review`;
+          }
+        }
+
+        function docExtractBadgeHtml(d) {
+          if (!d) return "";
+          if (d.extracted_error) {
+            return `<span class="doc-extract-badge err" title="${escapeHtml(d.extracted_error)}">extract error</span>`;
+          }
+          if (d.has_extracted_text) {
+            const k = d.extracted_chars >= 1000 ? `${Math.round(d.extracted_chars / 1000)}k` : String(d.extracted_chars);
+            return `<span class="doc-extract-badge ok" title="Text available for AI context">${k} chars</span>`;
+          }
+          return `<span class="doc-extract-badge warn" title="No extracted text yet">no text</span>`;
+        }
+
+        async function openDocPreview(docId) {
+          const meta = findProductDocMeta(docId);
+          if (!meta) return toast("Document not found");
+          el.docPreviewTitle.textContent = meta.doc.name || "Document";
+          el.docPreviewMeta.textContent = "Loading extracted text…";
+          el.docPreviewBody.textContent = "Loading…";
+          bootstrap.Modal.getOrCreateInstance(el.docPreviewModal).show();
+          const data = await apiGet(`/api/product-docs/${docId}`);
+          if (!data.ok) {
+            el.docPreviewBody.textContent = data.error || "Failed to load preview";
+            return;
+          }
+          const d = data.product_doc;
+          const parts = [];
+          if (d.doc_type) parts.push(`Type: ${d.doc_type}`);
+          if (d.extracted_chars) parts.push(`${d.extracted_chars.toLocaleString()} characters`);
+          if (d.extracted_error) parts.push(`Error: ${d.extracted_error}`);
+          el.docPreviewMeta.textContent = parts.join(" · ") || "No metadata";
+          el.docPreviewBody.textContent = d.extracted_preview || "(No extracted text — re-upload or try a different format.)";
         }
 
         function toast(msg) {
@@ -1505,6 +1821,7 @@
             el.caseSelect.appendChild(opt);
           });
           if (state.activeCaseId != null) el.caseSelect.value = String(state.activeCaseId);
+          renderChartSelect();
         }
 
         function updateWorkspaceSummary(c, charts) {
@@ -1539,6 +1856,13 @@
           } catch (_) {
             pane.classList.add("show");
           }
+        }
+
+        function productDocChipExtrasHtml(d) {
+          return (
+            docExtractBadgeHtml(d) +
+            `<button type="button" class="x" data-action="preview-doc" data-doc-id="${d.id}" title="Preview extracted text">👁</button>`
+          );
         }
 
         function productDocOpenLinkHtml(d) {
@@ -1610,6 +1934,7 @@
               dchip.className = "chip";
               dchip.innerHTML =
                 `📎 ${escapeHtml(d.name)} ` +
+                productDocChipExtrasHtml(d) +
                 productDocOpenLinkHtml(d) +
                 `<button type="button" class="x" data-action="rename-doc" data-doc-id="${d.id}" title="Rename">✎</button>` +
                 `<button type="button" class="x" data-action="delete-doc" data-doc-id="${d.id}" aria-label="Remove document">×</button>`;
@@ -1654,6 +1979,7 @@
               dchip.className = "chip border-warning";
               dchip.innerHTML =
                 `📎 ${escapeHtml(d.name)} ` +
+                productDocChipExtrasHtml(d) +
                 productDocOpenLinkHtml(d) +
                 `<button type="button" class="x" data-action="rename-doc" data-doc-id="${d.id}" title="Rename">✎</button>` +
                 `<button type="button" class="x" data-action="assign-doc-active-chart" data-doc-id="${d.id}" title="Link to active claim chart">🔗</button>` +
@@ -1667,7 +1993,13 @@
 
         function renderTable() {
           el.claimTbody.innerHTML = "";
-          const rows = (state.activeChart && state.activeChart.rows) || [];
+          const allRows = (state.activeChart && state.activeChart.rows) || [];
+          const q = (ui.rowSearchQuery || "").trim();
+          const rows = allRows.filter((r) => rowMatchesStrengthFilter(r) && rowMatchesSearch(r, q));
+
+          renderHealthSummary();
+          renderPendingBar();
+          syncToolbarEnabled();
 
           if (!state.activeChartId) {
             el.rowCountBadge.textContent = "0 rows";
@@ -1675,10 +2007,28 @@
             return;
           }
 
-          el.rowCountBadge.textContent = `${rows.length} rows`;
+          const filteredNote =
+            rows.length !== allRows.length
+              ? ` · showing ${rows.length}/${allRows.length}`
+              : "";
+          el.rowCountBadge.textContent = `${allRows.length} rows${filteredNote}`;
 
           if (state.activeChart && state.activeChart.status === "error") {
             el.claimTbody.innerHTML = `<tr><td colspan="3" class="text-danger">Parse error: ${escapeHtml(state.activeChart.error_message || "Unknown error")}</td></tr>`;
+            return;
+          }
+
+          if (!rows.length && allRows.length) {
+            el.claimTbody.innerHTML = `<tr><td colspan="3" class="text-muted">No rows match the current filter. <button type="button" class="btn btn-link btn-sm p-0" id="clearFiltersBtn">Clear filters</button></td></tr>`;
+            document.getElementById("clearFiltersBtn")?.addEventListener("click", () => {
+              ui.strengthFilter = "all";
+              ui.rowSearchQuery = "";
+              if (el.rowSearchInput) el.rowSearchInput.value = "";
+              document.querySelectorAll("[data-strength-filter]").forEach((b) => {
+                b.classList.toggle("active", b.getAttribute("data-strength-filter") === "all");
+              });
+              renderTable();
+            });
             return;
           }
 
@@ -1713,7 +2063,7 @@
                     </div>
                   </div>`;
               }
-              return `<div class="cell-body">${escapeHtml(r[key] || "")}</div>`;
+              return `<div class="cell-body">${highlightSearchText(r[key] || "", q)}</div>`;
             };
 
             const st = r.strength || "weak";
@@ -1882,6 +2232,44 @@
           renderChat();
         }
 
+        async function acceptAllSuggestions() {
+          if (!ui.pendingSuggestions.length || !state.activeChartId) return;
+          const batch = ui.pendingSuggestions.map((s) => ({ ...s }));
+          const data = await apiPostJson(`/api/claim-charts/${state.activeChartId}/suggestions/apply-bulk`, {
+            suggestions: batch,
+          });
+          if (!data.ok) return toast("Failed to apply suggestions");
+          state.activeChart = data.claim_chart;
+          clearPendingSuggestion();
+          toast(`✓ ${data.applied || batch.length} change(s) accepted`);
+          renderTable();
+          renderChat();
+          syncUndoRedoButtons();
+          refreshChangeLog();
+          renderAdminPanel();
+        }
+
+        function rejectAllSuggestions() {
+          if (!ui.pendingSuggestions.length) return;
+          ui.pendingSuggestions = [];
+          ui.activeRowId = null;
+          renderTable();
+          renderChat();
+          toast("✗ All suggestions rejected");
+        }
+
+        async function reassessAllStrengths() {
+          if (!state.activeChartId) return;
+          if (el.reassessStrengthsBtn) el.reassessStrengthsBtn.disabled = true;
+          toast("Re-assessing row strengths…");
+          const data = await apiPostJson(`/api/claim-charts/${state.activeChartId}/reassess-strengths`, {});
+          if (el.reassessStrengthsBtn) el.reassessStrengthsBtn.disabled = false;
+          if (!data.ok) return toast("Strength assessment failed");
+          state.activeChart = data.claim_chart;
+          renderTable();
+          toast("Strength badges updated");
+        }
+
         function rejectNewRow(index) {
           if (index < 0 || index >= ui.pendingNewRows.length) return;
           ui.pendingNewRows.splice(index, 1);
@@ -1926,6 +2314,8 @@
           el.chatInput.value = "";
           autoExpandTextarea(el.chatInput);
           clearPendingSuggestion();
+          renderChartSelect();
+          saveWorkspacePrefs();
           renderDocs();
           renderTable();
           renderChat();
@@ -1939,7 +2329,10 @@
           apiPostJson(`/api/claim-charts/${state.activeChartId}/suggestions/apply`, { suggestion: s }).then((data) => {
             if (!data.ok) return toast("Failed to apply suggestion");
             state.activeChart = data.claim_chart;
-            clearPendingSuggestion();
+            ui.pendingSuggestions = ui.pendingSuggestions.filter(
+              (x) => !(x.row_id === s.row_id && x.field === s.field)
+            );
+            if (!ui.pendingSuggestions.length) ui.activeRowId = null;
             setActiveRow(s.row_id);
             toast("✓ Change accepted");
             renderTable();
@@ -2144,6 +2537,7 @@
                 old_text: s.old_text,
                 new_text: s.new_text,
               }));
+              renderPendingBar();
               setActiveRow(ui.pendingSuggestions[0].row_id);
               if (suggestions.length === 1 && userWantsApplyViaChat(msg)) {
                 applySuggestion({
@@ -2172,6 +2566,7 @@
             el.chatInput.value = "";
             autoExpandTextarea(el.chatInput);
             clearPendingSuggestion();
+            saveWorkspacePrefs();
             renderDocs();
             renderTable();
             renderChat();
@@ -2252,20 +2647,54 @@
               toast("Select a claim chart first");
               return;
             }
-            window.location.href = `/api/claim-charts/${state.activeChartId}/export.docx?v=${Date.now()}`;
+            const fmt = (el.exportFormatSelect && el.exportFormatSelect.value) || "docx";
+            const ext = fmt === "csv" ? "csv" : fmt === "xlsx" ? "xlsx" : "docx";
+            window.location.href = `/api/claim-charts/${state.activeChartId}/export.${ext}?v=${Date.now()}`;
             bootstrap.Modal.getOrCreateInstance(el.exportModal).hide();
           });
 
-          el.undoChartBtn.addEventListener("click", undoLastChange);
-          el.redoChartBtn.addEventListener("click", redoLastChange);
+          el.acceptAllBtn.addEventListener("click", acceptAllSuggestions);
+          el.rejectAllBtn.addEventListener("click", rejectAllSuggestions);
+          el.reassessStrengthsBtn.addEventListener("click", reassessAllStrengths);
+
+          if (el.chartSelect) {
+            el.chartSelect.addEventListener("change", () => {
+              const id = Number(el.chartSelect.value);
+              if (id && !Number.isNaN(id)) loadChart(id);
+            });
+          }
+
+          if (el.rowSearchInput) {
+            el.rowSearchInput.addEventListener("input", () => {
+              ui.rowSearchQuery = el.rowSearchInput.value || "";
+              renderTable();
+            });
+          }
+
+          document.querySelectorAll("[data-strength-filter]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+              ui.strengthFilter = btn.getAttribute("data-strength-filter") || "all";
+              document.querySelectorAll("[data-strength-filter]").forEach((b) => {
+                b.classList.toggle("active", b === btn);
+              });
+              saveWorkspacePrefs();
+              renderTable();
+            });
+          });
+
           el.densityCompactBtn.addEventListener("click", () => {
             ui.tableDensity = "compact";
             applyTableDensity();
+            saveWorkspacePrefs();
           });
           el.densityComfortBtn.addEventListener("click", () => {
             ui.tableDensity = "comfort";
             applyTableDensity();
+            saveWorkspacePrefs();
           });
+
+          el.undoChartBtn.addEventListener("click", undoLastChange);
+          el.redoChartBtn.addEventListener("click", redoLastChange);
 
           el.createCaseBtn.addEventListener("click", async () => {
             const name = (prompt("Matter name", "New matter") || "").trim();
@@ -2485,6 +2914,11 @@
                 return;
               }
 
+              if (action === "preview-doc") {
+                openDocPreview(docId);
+                return;
+              }
+
               if (action === "rename-doc") {
                 const meta = findProductDocMeta(docId);
                 const cur = meta ? meta.doc : { name: "" };
@@ -2626,20 +3060,97 @@
                 setActiveRow(rowId);
                 rejectSuggestion(rowId, field);
               }
+              return;
+            }
+            if (target.closest("[data-action='chat-accept-all']")) {
+              acceptAllSuggestions();
+              return;
+            }
+            if (target.closest("[data-action='chat-reject-all']")) {
+              rejectAllSuggestions();
+            }
+          });
+
+          document.addEventListener("keydown", (e) => {
+            const tag = (document.activeElement && document.activeElement.tagName) || "";
+            const inField = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+            if (e.ctrlKey && e.key === "f") {
+              e.preventDefault();
+              if (el.rowSearchInput) {
+                el.rowSearchInput.focus();
+                el.rowSearchInput.select();
+              }
+              return;
+            }
+            if (e.ctrlKey && e.key === "z" && !inField) {
+              e.preventDefault();
+              if (e.shiftKey) redoLastChange();
+              else undoLastChange();
+              return;
+            }
+            if (e.ctrlKey && e.key === "Enter" && document.activeElement === el.chatInput) {
+              e.preventDefault();
+              const v = el.chatInput.value;
+              el.chatInput.value = "";
+              autoExpandTextarea(el.chatInput);
+              sendMessage(v);
+              return;
+            }
+            if (!inField && e.key === "a" && !e.ctrlKey && !e.metaKey && ui.pendingSuggestions.length) {
+              e.preventDefault();
+              acceptAllSuggestions();
+              return;
+            }
+            if (!inField && e.key === "Escape" && ui.pendingSuggestions.length) {
+              e.preventDefault();
+              rejectAllSuggestions();
+              return;
+            }
+            if (e.key === "?" && !inField) {
+              e.preventDefault();
+              bootstrap.Modal.getOrCreateInstance(document.getElementById("shortcutsModal")).show();
             }
           });
         }
 
         async function boot() {
+          const prefs = loadWorkspacePrefs();
+          if (prefs) {
+            ui.tableDensity = prefs.tableDensity === "comfort" ? "comfort" : "compact";
+            ui.strengthFilter = prefs.strengthFilter || "all";
+            document.querySelectorAll("[data-strength-filter]").forEach((b) => {
+              b.classList.toggle("active", b.getAttribute("data-strength-filter") === ui.strengthFilter);
+            });
+          }
           applyTableDensity();
           await refreshCases();
-          renderTable();
-          renderChat();
+          if (prefs && prefs.activeCaseId) {
+            const caseOk = state.cases.some((c) => c.id === prefs.activeCaseId);
+            if (caseOk) {
+              state.activeCaseId = prefs.activeCaseId;
+              renderCaseSelect();
+              if (prefs.activeChartId) {
+                const ac = getActiveCase();
+                const chartOk = ac && (ac.claim_charts || []).some((ch) => ch.id === prefs.activeChartId);
+                if (chartOk) await loadChart(prefs.activeChartId);
+              }
+            }
+          }
+          if (!state.activeChartId) {
+            renderTable();
+            renderChat();
+          }
           syncUndoRedoButtons();
           refreshChangeLog();
           renderAdminPanel();
           wireEvents();
           autoExpandTextarea(el.chatInput);
+          try {
+            if (!localStorage.getItem(WELCOME_KEY) && el.welcomeModal) {
+              localStorage.setItem(WELCOME_KEY, "1");
+              bootstrap.Modal.getOrCreateInstance(el.welcomeModal).show();
+            }
+          } catch (_) {}
         }
 
         boot();

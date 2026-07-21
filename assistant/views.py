@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import os
@@ -13,6 +14,7 @@ from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
+from openpyxl import Workbook
 
 from .models import Case, ChatMessage, ClaimChart, ClaimChartRow, ProductDoc, RowChange
 from .parsing import ParseError, extract_product_doc_text, parse_claim_chart
@@ -450,6 +452,8 @@ def _safe_file_url(f) -> str:
 
 
 def _product_doc_brief(d: ProductDoc) -> Dict[str, Any]:
+    text = (d.extracted_text or "").strip()
+    err = (d.extracted_error or "").strip()
     return {
         "id": d.id,
         "name": d.name,
@@ -458,7 +462,29 @@ def _product_doc_brief(d: ProductDoc) -> Dict[str, Any]:
         "created_at": d.created_at.isoformat(),
         "file_url": _safe_file_url(d.file),
         "source_url": (d.source_url or "").strip(),
+        "extracted_chars": len(text),
+        "extracted_error": err,
+        "has_extracted_text": bool(text),
+        "extracted_at": d.extracted_at.isoformat() if d.extracted_at else None,
     }
+
+
+@require_GET
+def api_product_doc_detail(request, doc_id: int):
+    d = get_object_or_404(ProductDoc, id=doc_id)
+    text = (d.extracted_text or "").strip()
+    preview = text[:8000]
+    if len(text) > 8000:
+        preview += "\n\n[… truncated for preview — full text used in AI context …]"
+    return JsonResponse(
+        {
+            "ok": True,
+            "product_doc": {
+                **_product_doc_brief(d),
+                "extracted_preview": preview,
+            },
+        }
+    )
 
 
 @require_GET
@@ -611,15 +637,25 @@ def api_claim_chart_row_update(request, chart_id: int):
     except Exception:
         return JsonResponse({"ok": False, "error": "row_index required"}, status=400)
     row = get_object_or_404(ClaimChartRow, claim_chart=ch, row_index=row_index)
+    manual_changes: List[Tuple[str, str, str]] = []
     upd = []
     if "claim" in body:
-        row.claim_text = str(body.get("claim") or "")
+        new_val = str(body.get("claim") or "")
+        if new_val != row.claim_text:
+            manual_changes.append(("claim", row.claim_text, new_val))
+        row.claim_text = new_val
         upd.append("claim_text")
     if "evidence" in body:
-        row.evidence_text = str(body.get("evidence") or "")
+        new_val = str(body.get("evidence") or "")
+        if new_val != row.evidence_text:
+            manual_changes.append(("evidence", row.evidence_text, new_val))
+        row.evidence_text = new_val
         upd.append("evidence_text")
     if "reasoning" in body:
-        row.reasoning_text = str(body.get("reasoning") or "")
+        new_val = str(body.get("reasoning") or "")
+        if new_val != row.reasoning_text:
+            manual_changes.append(("reasoning", row.reasoning_text, new_val))
+        row.reasoning_text = new_val
         upd.append("reasoning_text")
     st = body.get("strength")
     if st in ("strong", "weak", "missing"):
@@ -629,6 +665,17 @@ def api_claim_chart_row_update(request, chart_id: int):
     if og in (ClaimChartRow.RowOrigin.UPLOAD, ClaimChartRow.RowOrigin.ADDED):
         row.origin = og
         upd.append("origin")
+    if manual_changes:
+        _invalidate_redo_branch(ch)
+        with transaction.atomic():
+            for field, old_text, new_text in manual_changes:
+                RowChange.objects.create(
+                    claim_chart=ch,
+                    row_index=row_index,
+                    field=field,
+                    old_text=old_text,
+                    new_text=new_text,
+                )
     if upd:
         row.save(update_fields=upd)
     run_llm_strength = st not in ("strong", "weak", "missing")
@@ -958,52 +1005,188 @@ def api_claim_chart_detail(request, chart_id: int):
     return JsonResponse({"ok": True, "claim_chart": _chart_to_dict(ch)})
 
 
-def _safe_docx_filename(name: str) -> str:
+def _safe_export_filename(name: str, ext: str) -> str:
     base = (name or "claim-chart").strip() or "claim-chart"
     for c in '<>:"/\\|?*\n\r':
         base = base.replace(c, "_")
     base = base[:150]
-    if not base.lower().endswith(".docx"):
-        base = f"{base}.docx"
-    return base
+    if base.lower().endswith(f".{ext}"):
+        return base
+    return f"{base}.{ext}"
+
+
+def _chart_rows_ordered(chart_id: int):
+    return ClaimChartRow.objects.filter(claim_chart_id=chart_id).order_by("row_index")
 
 
 @require_GET
 def api_claim_chart_export_docx(request, chart_id: int):
     ch = get_object_or_404(ClaimChart.objects.select_related("case"), id=chart_id)
-    # Always read rows fresh from DB (no stale prefetch); order matches on-screen chart.
-    rows_qs = ClaimChartRow.objects.filter(claim_chart_id=ch.pk).order_by("row_index")
+    rows_qs = _chart_rows_ordered(ch.pk)
     doc = Document()
     doc.add_heading(ch.name or "Claim chart", level=1)
     meta = doc.add_paragraph()
     meta.add_run("Case: ").bold = True
     meta.add_run(ch.case.name if ch.case else "—")
-    table = doc.add_table(rows=1, cols=4)
+    table = doc.add_table(rows=1, cols=6)
     hdr_cells = table.rows[0].cells
     hdr_cells[0].text = "#"
     hdr_cells[1].text = "Claim limitation / element"
     hdr_cells[2].text = "Evidence (prior art / exhibit)"
     hdr_cells[3].text = "How the reference teaches / discloses"
+    hdr_cells[4].text = "Strength"
+    hdr_cells[5].text = "Origin"
     for row in rows_qs:
         cells = table.add_row().cells
         cells[0].text = str(row.row_index)
         cells[1].text = row.claim_text or ""
         cells[2].text = row.evidence_text or ""
         cells[3].text = row.reasoning_text or ""
+        cells[4].text = row.strength or ""
+        cells[5].text = row.origin or ""
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
-    fname = _safe_docx_filename(ch.name or "claim-chart")
+    fname = _safe_export_filename(ch.name or "claim-chart", "docx")
     resp = FileResponse(
         buf,
         as_attachment=True,
         filename=fname,
         content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
-    # Browsers often cache GET downloads; avoid serving an old .docx after the chart changed.
     resp["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp["Pragma"] = "no-cache"
     return resp
+
+
+@require_GET
+def api_claim_chart_export_csv(request, chart_id: int):
+    ch = get_object_or_404(ClaimChart.objects.select_related("case"), id=chart_id)
+    rows_qs = _chart_rows_ordered(ch.pk)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        ["row_index", "claim", "evidence", "reasoning", "strength", "origin", "case", "chart"]
+    )
+    for row in rows_qs:
+        writer.writerow(
+            [
+                row.row_index,
+                row.claim_text or "",
+                row.evidence_text or "",
+                row.reasoning_text or "",
+                row.strength or "",
+                row.origin or "",
+                ch.case.name if ch.case else "",
+                ch.name or "",
+            ]
+        )
+    data = buf.getvalue().encode("utf-8-sig")
+    out = io.BytesIO(data)
+    fname = _safe_export_filename(ch.name or "claim-chart", "csv")
+    resp = FileResponse(out, as_attachment=True, filename=fname, content_type="text/csv; charset=utf-8")
+    resp["Cache-Control"] = "no-store"
+    return resp
+
+
+@require_GET
+def api_claim_chart_export_xlsx(request, chart_id: int):
+    ch = get_object_or_404(ClaimChart.objects.select_related("case"), id=chart_id)
+    rows_qs = _chart_rows_ordered(ch.pk)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Claim chart"
+    ws.append(
+        ["row_index", "claim", "evidence", "reasoning", "strength", "origin", "case", "chart"]
+    )
+    for row in rows_qs:
+        ws.append(
+            [
+                row.row_index,
+                row.claim_text or "",
+                row.evidence_text or "",
+                row.reasoning_text or "",
+                row.strength or "",
+                row.origin or "",
+                ch.case.name if ch.case else "",
+                ch.name or "",
+            ]
+        )
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname = _safe_export_filename(ch.name or "claim-chart", "xlsx")
+    resp = FileResponse(
+        buf,
+        as_attachment=True,
+        filename=fname,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    resp["Cache-Control"] = "no-store"
+    return resp
+
+
+@require_POST
+@csrf_exempt
+def api_claim_chart_reassess_strengths(request, chart_id: int):
+    ch = get_object_or_404(ClaimChart, id=chart_id)
+    sync_claim_chart_strengths(ch)
+    ch = ClaimChart.objects.prefetch_related("rows", "chat_messages").get(pk=ch.pk)
+    return JsonResponse({"ok": True, "claim_chart": _chart_to_dict(ch)})
+
+
+@require_POST
+@csrf_exempt
+def api_claim_chart_apply_suggestions_bulk(request, chart_id: int):
+    ch = get_object_or_404(ClaimChart.objects.select_related("case"), id=chart_id)
+    try:
+        body = json.loads(request.body.decode("utf-8") or "{}")
+    except Exception:
+        body = {}
+    suggestions = body.get("suggestions") or []
+    if not isinstance(suggestions, list) or not suggestions:
+        return JsonResponse({"ok": False, "error": "suggestions list required"}, status=400)
+
+    _invalidate_redo_branch(ch)
+    applied = 0
+    with transaction.atomic():
+        for suggestion in suggestions:
+            if not isinstance(suggestion, dict):
+                continue
+            row_id = int(suggestion.get("row_id") or 0)
+            field = suggestion.get("field")
+            new_text = suggestion.get("new_text") or ""
+            if row_id <= 0 or field not in ("claim", "evidence", "reasoning"):
+                continue
+            row = ClaimChartRow.objects.filter(claim_chart=ch, row_index=row_id).first()
+            if not row:
+                continue
+            old_text = (
+                row.claim_text
+                if field == "claim"
+                else row.evidence_text
+                if field == "evidence"
+                else row.reasoning_text
+            )
+            RowChange.objects.create(
+                claim_chart=ch,
+                row_index=row_id,
+                field=field,
+                old_text=old_text,
+                new_text=new_text,
+            )
+            if field == "claim":
+                row.claim_text = new_text
+            elif field == "evidence":
+                row.evidence_text = new_text
+            else:
+                row.reasoning_text = new_text
+            row.save(update_fields=["claim_text", "evidence_text", "reasoning_text"])
+            sync_one_row_strength(row)
+            applied += 1
+
+    ch = ClaimChart.objects.prefetch_related("rows", "chat_messages").get(pk=ch.pk)
+    return JsonResponse({"ok": True, "applied": applied, "claim_chart": _chart_to_dict(ch)})
 
 
 @require_POST

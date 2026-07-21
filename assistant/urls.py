@@ -32,6 +32,19 @@ urlpatterns = [
     path("api/claim-charts/<int:chart_id>/undo", views.api_claim_chart_undo, name="api_claim_chart_undo"),
     path("api/claim-charts/<int:chart_id>/redo", views.api_claim_chart_redo, name="api_claim_chart_redo"),
     path("api/claim-charts/<int:chart_id>/history", views.api_claim_chart_history, name="api_claim_chart_history"),
+    path(
+        "api/claim-charts/<int:chart_id>/suggestions/apply-bulk",
+        views.api_claim_chart_apply_suggestions_bulk,
+        name="api_claim_chart_apply_suggestions_bulk",
+    ),
+    path(
+        "api/claim-charts/<int:chart_id>/reassess-strengths",
+        views.api_claim_chart_reassess_strengths,
+        name="api_claim_chart_reassess_strengths",
+    ),
+    path("api/product-docs/<int:doc_id>", views.api_product_doc_detail, name="api_product_doc_detail"),
     path("api/claim-charts/<int:chart_id>/export.docx", views.api_claim_chart_export_docx, name="api_claim_chart_export_docx"),
+    path("api/claim-charts/<int:chart_id>/export.csv", views.api_claim_chart_export_csv, name="api_claim_chart_export_csv"),
+    path("api/claim-charts/<int:chart_id>/export.xlsx", views.api_claim_chart_export_xlsx, name="api_claim_chart_export_xlsx"),
 ]
 
