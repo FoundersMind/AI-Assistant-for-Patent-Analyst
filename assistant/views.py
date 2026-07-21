@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from django.conf import settings
 from django.db import transaction
 from django.db.models import Max, Prefetch
-from django.http import FileResponse, JsonResponse
+from django.http import FileResponse, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
@@ -420,6 +420,24 @@ def _chart_to_dict(chart: ClaimChart) -> Dict:
 def index(request):
     # UI now loads dynamically from APIs (no seeded state).
     return render(request, "assistant/index_db.html", {})
+
+
+def robots_txt(request):
+    """Explicit allow for Anthropic/Claude fetchers and other crawlers (no Disallow)."""
+    body = (
+        "User-agent: Claude-User\n"
+        "Allow: /\n"
+        "\n"
+        "User-agent: Claude-SearchBot\n"
+        "Allow: /\n"
+        "\n"
+        "User-agent: ClaudeBot\n"
+        "Allow: /\n"
+        "\n"
+        "User-agent: *\n"
+        "Allow: /\n"
+    )
+    return HttpResponse(body, content_type="text/plain; charset=utf-8")
 
 
 def _safe_file_url(f) -> str:

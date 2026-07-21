@@ -5,6 +5,7 @@ from . import views
 
 urlpatterns = [
     path("", views.index, name="index"),
+    path("robots.txt", views.robots_txt, name="robots_txt"),
     path("api/cases", views.api_cases, name="api_cases"),
     path("api/cases/create", views.api_cases_create, name="api_cases_create"),
     path("api/cases/<int:case_id>/update", views.api_case_update, name="api_case_update"),
