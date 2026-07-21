@@ -51,7 +51,7 @@ def _env_csv(name: str, default: str) -> list[str]:
     return out
 
 
-# Hosts: DJANGO_ALLOWED_HOSTS and/or Render's RENDER_EXTERNAL_HOSTNAME / RENDER_EXTERNAL_URL.
+# Hosts: DJANGO_ALLOWED_HOSTS and/or Render / Vercel deployment hostnames.
 _allowed_hosts = _env_csv("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost")
 _render_host = (os.getenv("RENDER_EXTERNAL_HOSTNAME") or "").strip().strip('"').strip("'")
 if not _render_host:
@@ -63,10 +63,24 @@ if not _render_host:
             _render_host = ""
 if _render_host and _render_host not in _allowed_hosts:
     _allowed_hosts.append(_render_host)
+
+# Vercel sets VERCEL_URL (no scheme), e.g. my-app-xxx.vercel.app
+_vercel_host = (os.getenv("VERCEL_URL") or "").strip().strip('"').strip("'")
+if _vercel_host:
+    try:
+        _vercel_host = (urlparse(f"https://{_vercel_host}").hostname or _vercel_host).strip()
+    except Exception:
+        pass
+if _vercel_host and _vercel_host not in _allowed_hosts:
+    _allowed_hosts.append(_vercel_host)
+# Allow all *.vercel.app preview / production URLs (Django subdomain wildcard).
+if ".vercel.app" not in _allowed_hosts:
+    _allowed_hosts.append(".vercel.app")
+
 ALLOWED_HOSTS = _allowed_hosts
 
-# Behind Render's reverse proxy, Django should trust X-Forwarded-Proto for HTTPS URLs.
-if _render_host:
+# Behind Render/Vercel reverse proxies, Django should trust X-Forwarded-Proto for HTTPS URLs.
+if _render_host or _vercel_host or os.getenv("VERCEL"):
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 # Larger chart uploads (multipart body + file) — avoid 400/413 edge cases on Render.
@@ -175,9 +189,11 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 
 # Trusted origins for CSRF. Set DJANGO_CSRF_TRUSTED_ORIGINS=https://your.onrender.com (no extra quotes).
 _csrf_origins = _env_csv("DJANGO_CSRF_TRUSTED_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000")
-if _render_host:
+for _proxy_host in (_render_host, _vercel_host):
+    if not _proxy_host:
+        continue
     for _scheme in ("https", "http"):
-        _origin = f"{_scheme}://{_render_host}"
+        _origin = f"{_scheme}://{_proxy_host}"
         if _origin not in _csrf_origins:
             _csrf_origins.append(_origin)
 CSRF_TRUSTED_ORIGINS = _csrf_origins
