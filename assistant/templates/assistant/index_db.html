@@ -1676,6 +1676,7 @@
         }
 
         function setUploadState(active, opts = {}) {
+          const wasChartUpload = ui.upload.active && ui.upload.kind === "chart";
           if (active) {
             ui.upload = {
               active: true,
@@ -1719,7 +1720,11 @@
           if (el.sendBtn) el.sendBtn.disabled = active;
           if (el.claimScroll) el.claimScroll.setAttribute("aria-busy", active && ui.upload.kind === "chart" ? "true" : "false");
           syncToolbarEnabled();
-          if (active && ui.upload.kind === "chart") renderTable();
+          if (active && ui.upload.kind === "chart") {
+            renderTable();
+          } else if (!active && wasChartUpload) {
+            renderTable();
+          }
         }
 
         function beginChartUpload(fileName) {
@@ -1928,12 +1933,22 @@
         }
 
         /** Multipart uploads: never set Content-Type (browser sets boundary). Surfaces non-JSON errors. */
-        async function apiPostFormData(url, formData) {
+        async function apiPostFormData(url, formData, opts = {}) {
+          const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 180000;
           let r;
           try {
-            r = await fetch(url, { method: "POST", body: formData });
+            r = await fetch(url, {
+              method: "POST",
+              body: formData,
+              signal: AbortSignal.timeout(timeoutMs),
+            });
           } catch (e) {
-            toast(`Network error: ${e && e.message ? e.message : "request failed"}`);
+            const timedOut = e && e.name === "TimeoutError";
+            toast(
+              timedOut
+                ? "Upload timed out — the server may still be waking up. Refresh and check whether the chart appeared."
+                : `Network error: ${e && e.message ? e.message : "request failed"}`
+            );
             return { ok: false };
           }
           const text = await r.text();
@@ -2177,7 +2192,13 @@
           renderPendingBar();
           syncToolbarEnabled();
 
-          if (ui.upload.active && ui.upload.kind === "chart") {
+          if (!state.activeChartId) {
+            el.rowCountBadge.textContent = "0 rows";
+            el.claimTbody.innerHTML = `<tr><td colspan="3" class="text-muted">Upload a claim chart to begin.</td></tr>`;
+            return;
+          }
+
+          if (ui.upload.active && ui.upload.kind === "chart" && !allRows.length) {
             el.rowCountBadge.textContent = "Processing…";
             el.claimTbody.innerHTML = `<tr><td colspan="3" class="upload-table-placeholder">
               <div class="upload-table-placeholder-inner">
@@ -2188,17 +2209,14 @@
             return;
           }
 
-          if (!state.activeChartId) {
-            el.rowCountBadge.textContent = "0 rows";
-            el.claimTbody.innerHTML = `<tr><td colspan="3" class="text-muted">Upload a claim chart to begin.</td></tr>`;
-            return;
-          }
-
           const filteredNote =
             rows.length !== allRows.length
               ? ` · showing ${rows.length}/${allRows.length}`
               : "";
-          el.rowCountBadge.textContent = `${allRows.length} rows${filteredNote}`;
+          el.rowCountBadge.textContent =
+            ui.upload.active && ui.upload.kind === "chart"
+              ? "Processing…"
+              : `${allRows.length} rows${filteredNote}`;
 
           if (state.activeChart && state.activeChart.status === "error") {
             el.claimTbody.innerHTML = `<tr><td colspan="3" class="text-danger">Parse error: ${escapeHtml(state.activeChart.error_message || "Unknown error")}</td></tr>`;
@@ -3245,13 +3263,16 @@
                 fd.append("case_id", String(c.id));
                 fd.append("file", f);
                 const data = await apiPostFormData("/api/claim-charts/upload", fd);
+                endUploadState();
                 if (!data || !data.ok) return;
                 await refreshCases();
                 await loadChart(data.claim_chart.id);
                 toast("Claim chart uploaded");
+              } catch (e) {
+                endUploadState();
+                toast(`Upload failed: ${e && e.message ? e.message : "unknown error"}`);
               } finally {
                 el.chartFileInput.value = "";
-                endUploadState();
               }
             })();
           });
