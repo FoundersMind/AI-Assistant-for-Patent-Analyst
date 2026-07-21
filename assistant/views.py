@@ -5,6 +5,7 @@ import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote, unquote
 
 from django.conf import settings
 from django.db import transaction
@@ -26,6 +27,9 @@ try:
 except Exception:  # pragma: no cover
     Groq = None
 
+LUMENCI_SUG_START = "<<<LUMENCI_SUG>>>"
+LUMENCI_SUG_END = "<<<END_LUMENCI_SUG>>>"
+
 
 SYSTEM_PROMPT = (
     "You are Lumenci Assistant, an AI specialized in patent infringement analysis. "
@@ -43,6 +47,10 @@ SYSTEM_PROMPT = (
     "document text is provided. If a document has no extracted text, say it could not be processed yet and ask for a different format.\n\n"
     "Structured chart edits MUST appear inside <lumenci_suggestion_json> ... </lumenci_suggestion_json> exactly (not only as a naked JSON block). "
     "When the analyst says to apply changes, keep emitting that tagged JSON so the app can update the grid.\n\n"
+    "WORKSPACE COMMANDS: The analyst can also control the app by typing short commands in chat — you do not execute these "
+    "yourself, the app does. Supported examples: **accept**, **accept all**, **reject all**, **accept row 3 reasoning**, "
+    "**reject row 2**, **undo**, **redo**, **accept new row(s)**, **reassess strengths**. After proposing edits, tell them "
+    "they can say **accept all** or **accept row N** instead of clicking buttons.\n\n"
     "IMPORTANT: At the end of your response, include a machine-readable JSON block between "
     "<lumenci_suggestion_json> and </lumenci_suggestion_json>. The JSON schema must be:\n"
     "{\n"
@@ -155,6 +163,13 @@ def _json_candidate_strings(text: str) -> List[str]:
     """Collect JSON blobs that may contain lumenci suggestion schema (models often skip XML tags)."""
     text = text or ""
     out: List[str] = []
+    i = text.find(LUMENCI_SUG_START)
+    if i != -1:
+        j = text.find(LUMENCI_SUG_END, i)
+        if j != -1:
+            inner = unquote(text[i + len(LUMENCI_SUG_START) : j].strip())
+            if inner:
+                out.append(inner)
     lo = text.lower()
     otag = "<lumenci_suggestion_json>"
     ctag = "</lumenci_suggestion_json>"
@@ -194,6 +209,11 @@ def _json_candidate_strings(text: str) -> List[str]:
 def _strip_machine_json_for_display(text: str) -> str:
     """Keep chat readable: drop tagged blocks and obvious JSON code fences."""
     t = text or ""
+    i = t.find(LUMENCI_SUG_START)
+    if i != -1:
+        j = t.find(LUMENCI_SUG_END, i)
+        if j != -1:
+            t = (t[:i] + t[j + len(LUMENCI_SUG_END) :]).strip()
     lo = t.lower()
     otag = "<lumenci_suggestion_json>"
     ctag = "</lumenci_suggestion_json>"
@@ -225,6 +245,457 @@ def _extract_lumenci_payload(text: str) -> Tuple[str, List[Dict], List[Dict]]:
     return display, suggestions, new_rows
 
 
+def _embed_suggestions_for_storage(
+    prose: str, suggestions: List[Dict[str, Any]], new_rows: List[Dict[str, str]]
+) -> str:
+    if not suggestions and not new_rows:
+        return prose or ""
+    payload = json.dumps({"suggestions": suggestions, "new_rows": new_rows}, ensure_ascii=False)
+    return (prose or "").rstrip() + "\n" + LUMENCI_SUG_START + quote(payload) + LUMENCI_SUG_END
+
+
+def _recover_from_last_assistant(ch: ClaimChart) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    prev = (
+        ChatMessage.objects.filter(claim_chart=ch, role=ChatMessage.Role.ASSISTANT)
+        .order_by("-created_at", "-id")
+        .first()
+    )
+    if not prev or not (prev.content or "").strip():
+        return [], []
+    _, sug, nr = _extract_lumenci_payload(prev.content)
+    return (sug or []), (nr or [])
+
+
+def _user_wants_reject_all(msg: str) -> bool:
+    ml = (msg or "").strip().lower()
+    if not ml or len(ml) > 200:
+        return False
+    if ml in ("reject", "no", "nope", "decline", "dismiss"):
+        return True
+    triggers = (
+        "reject all",
+        "reject everything",
+        "dismiss all",
+        "decline all",
+        "discard all",
+        "reject them",
+        "reject those",
+        "discard them",
+        "no thanks",
+        "don't apply",
+        "do not apply",
+        "skip",
+    )
+    return any(t in ml for t in triggers)
+
+
+def _user_wants_accept_all(msg: str) -> bool:
+    if _user_confirms_apply(msg):
+        return True
+    ml = (msg or "").strip().lower()
+    if not ml or len(ml) > 200:
+        return False
+    if ml in ("accept", "yes", "ok", "okay", "approved", "approve"):
+        return True
+    triggers = (
+        "accept all",
+        "accept everything",
+        "accept them",
+        "accept those",
+        "accept the suggestions",
+        "accept changes",
+        "accept it",
+        "accept that",
+        "yes accept",
+        "approve all",
+        "go with it",
+        "looks good",
+        "sounds good",
+    )
+    return any(t in ml for t in triggers)
+
+
+def _parse_row_workspace_command(msg: str) -> Optional[Dict[str, Any]]:
+    ml = (msg or "").strip()
+    if not ml:
+        return None
+    m = re.search(
+        r"\b(accept|reject|approve|dismiss)\b\s+(?:the\s+)?(?:row\s+|element\s+)?#?(\d+)(?:\s+[-:]?\s*(claim|evidence|reasoning))?",
+        ml,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    verb = m.group(1).lower()
+    row_id = int(m.group(2))
+    field_raw = (m.group(3) or "").lower()
+    action = "accept" if verb in ("accept", "approve") else "reject"
+    out: Dict[str, Any] = {"action": action, "row_id": row_id}
+    if field_raw in ("claim", "evidence", "reasoning"):
+        out["field"] = field_raw
+    return out
+
+
+def _user_wants_accept_new_rows(msg: str) -> bool:
+    ml = (msg or "").strip().lower()
+    triggers = (
+        "accept new row",
+        "accept new rows",
+        "accept proposed row",
+        "accept proposed rows",
+        "add the row",
+        "add the rows",
+        "add new row",
+        "add proposed row",
+        "insert the row",
+        "insert new row",
+    )
+    return any(t in ml for t in triggers)
+
+
+def _user_wants_reject_new_rows(msg: str) -> bool:
+    ml = (msg or "").strip().lower()
+    triggers = (
+        "reject new row",
+        "reject new rows",
+        "dismiss new row",
+        "dismiss proposed row",
+        "dismiss proposed rows",
+        "discard new row",
+    )
+    return any(t in ml for t in triggers)
+
+
+def _user_wants_reassess(msg: str) -> bool:
+    ml = (msg or "").strip().lower()
+    return any(
+        t in ml
+        for t in (
+            "reassess",
+            "re-assess",
+            "refresh strength",
+            "update strength",
+            "strength badges",
+            "reassess strengths",
+            "reassess all",
+        )
+    )
+
+
+def _apply_suggestions_to_chart(ch: ClaimChart, suggestions: List[Dict[str, Any]]) -> int:
+    if not suggestions:
+        return 0
+    _invalidate_redo_branch(ch)
+    applied = 0
+    with transaction.atomic():
+        for suggestion in suggestions:
+            if not isinstance(suggestion, dict):
+                continue
+            row_id = int(suggestion.get("row_id") or 0)
+            field = suggestion.get("field")
+            new_text = suggestion.get("new_text") or ""
+            if row_id <= 0 or field not in ("claim", "evidence", "reasoning"):
+                continue
+            row = ClaimChartRow.objects.filter(claim_chart=ch, row_index=row_id).first()
+            if not row:
+                continue
+            old_text = (
+                row.claim_text
+                if field == "claim"
+                else row.evidence_text
+                if field == "evidence"
+                else row.reasoning_text
+            )
+            RowChange.objects.create(
+                claim_chart=ch,
+                row_index=row_id,
+                field=field,
+                old_text=old_text,
+                new_text=new_text,
+            )
+            if field == "claim":
+                row.claim_text = new_text
+            elif field == "evidence":
+                row.evidence_text = new_text
+            else:
+                row.reasoning_text = new_text
+            row.save(update_fields=["claim_text", "evidence_text", "reasoning_text"])
+            sync_one_row_strength(row)
+            applied += 1
+    return applied
+
+
+def _apply_new_rows_to_chart(ch: ClaimChart, new_rows: List[Dict[str, str]]) -> int:
+    if not new_rows:
+        return 0
+    _invalidate_redo_branch(ch)
+    added = 0
+    with transaction.atomic():
+        for nr in new_rows:
+            if not isinstance(nr, dict):
+                continue
+            claim = (nr.get("claim") or "").strip()
+            evidence = (nr.get("evidence") or "").strip()
+            reasoning = (nr.get("reasoning") or "").strip()
+            if not (claim or evidence or reasoning):
+                continue
+            next_idx = (ch.rows.aggregate(m=Max("row_index"))["m"] or 0) + 1
+            snapshot = json.dumps(
+                {
+                    "claim": claim,
+                    "evidence": evidence,
+                    "reasoning": reasoning,
+                    "origin": ClaimChartRow.RowOrigin.ADDED,
+                },
+                ensure_ascii=False,
+            )
+            RowChange.objects.create(
+                claim_chart=ch,
+                row_index=next_idx,
+                field="add_row",
+                old_text="",
+                new_text=snapshot,
+            )
+            new_row = ClaimChartRow.objects.create(
+                claim_chart=ch,
+                row_index=next_idx,
+                origin=ClaimChartRow.RowOrigin.ADDED,
+                claim_text=claim,
+                evidence_text=evidence,
+                reasoning_text=reasoning,
+            )
+            sync_one_row_strength(new_row)
+            added += 1
+    return added
+
+
+def _workspace_command_response(
+    ch: ClaimChart,
+    assistant_text: str,
+    command: Dict[str, Any],
+    *,
+    clear_pending: bool = False,
+) -> JsonResponse:
+    stored = _embed_suggestions_for_storage(assistant_text, [], [])
+    ChatMessage.objects.create(claim_chart=ch, role=ChatMessage.Role.ASSISTANT, content=stored)
+    ch = ClaimChart.objects.prefetch_related("rows", "chat_messages").get(pk=ch.pk)
+    return JsonResponse(
+        {
+            "ok": True,
+            "assistant": assistant_text,
+            "suggestions": [],
+            "new_rows": [],
+            "claim_chart": _chart_to_dict(ch),
+            "strength_gate": {"removed": [], "removed_count": 0},
+            "workspace_command": command,
+            "clear_pending": clear_pending,
+        }
+    )
+
+
+def _try_workspace_command(ch: ClaimChart, user_message: str) -> Optional[JsonResponse]:
+    """Execute chart workspace actions from natural-language chat commands."""
+    ml = (user_message or "").strip().lower()
+    if not ml:
+        return None
+
+    if ml in ("undo", "undo last change"):
+        last = (
+            RowChange.objects.filter(claim_chart=ch, is_undone=False)
+            .order_by("-created_at", "-id")
+            .first()
+        )
+        if not last:
+            return _workspace_command_response(
+                ch, "Nothing to undo — no accepted changes on the stack.", {"type": "undo", "applied": 0}
+            )
+        row_to_resync = None
+        with transaction.atomic():
+            if last.field == "add_row":
+                ClaimChartRow.objects.filter(claim_chart=ch, row_index=last.row_index).delete()
+            else:
+                row = get_object_or_404(ClaimChartRow, claim_chart=ch, row_index=last.row_index)
+                if last.field == "claim":
+                    row.claim_text = last.old_text
+                elif last.field == "evidence":
+                    row.evidence_text = last.old_text
+                else:
+                    row.reasoning_text = last.old_text
+                row.save(update_fields=["claim_text", "evidence_text", "reasoning_text"])
+                row_to_resync = row
+            last.is_undone = True
+            last.undone_at = timezone.now()
+            last.save(update_fields=["is_undone", "undone_at"])
+        if row_to_resync is not None:
+            sync_one_row_strength(row_to_resync)
+        return _workspace_command_response(
+            ch, "↩ Undid the last accepted change.", {"type": "undo", "applied": 1}, clear_pending=True
+        )
+
+    if ml in ("redo", "redo last change"):
+        redo_op = (
+            RowChange.objects.filter(claim_chart=ch, is_undone=True, redo_invalidated=False)
+            .order_by("-undone_at", "-id")
+            .first()
+        )
+        if not redo_op:
+            return _workspace_command_response(
+                ch, "Nothing to redo.", {"type": "redo", "applied": 0}
+            )
+        row_to_resync = None
+        with transaction.atomic():
+            if redo_op.field == "add_row":
+                try:
+                    payload = json.loads(redo_op.new_text or "{}")
+                except json.JSONDecodeError:
+                    payload = {}
+                new_row = ClaimChartRow.objects.create(
+                    claim_chart=ch,
+                    row_index=redo_op.row_index,
+                    origin=payload.get("origin") or ClaimChartRow.RowOrigin.ADDED,
+                    claim_text=str(payload.get("claim") or ""),
+                    evidence_text=str(payload.get("evidence") or ""),
+                    reasoning_text=str(payload.get("reasoning") or ""),
+                )
+                row_to_resync = new_row
+            else:
+                row = get_object_or_404(ClaimChartRow, claim_chart=ch, row_index=redo_op.row_index)
+                if redo_op.field == "claim":
+                    row.claim_text = redo_op.new_text
+                elif redo_op.field == "evidence":
+                    row.evidence_text = redo_op.new_text
+                else:
+                    row.reasoning_text = redo_op.new_text
+                row.save(update_fields=["claim_text", "evidence_text", "reasoning_text"])
+                row_to_resync = row
+            redo_op.is_undone = False
+            redo_op.undone_at = None
+            redo_op.save(update_fields=["is_undone", "undone_at"])
+        if row_to_resync is not None:
+            sync_one_row_strength(row_to_resync)
+        return _workspace_command_response(
+            ch, "↪ Redid the last undone change.", {"type": "redo", "applied": 1}
+        )
+
+    if _user_wants_reassess(user_message):
+        sync_claim_chart_strengths(ch)
+        return _workspace_command_response(
+            ch,
+            "Re-assessed evidence strength for every row. Check the **S / W / M** badges in the chart.",
+            {"type": "reassess_strengths"},
+        )
+
+    recovered_sug, recovered_nr = _recover_from_last_assistant(ch)
+
+    row_cmd = _parse_row_workspace_command(user_message)
+    if row_cmd:
+        action = row_cmd["action"]
+        row_id = int(row_cmd["row_id"])
+        field_filter = row_cmd.get("field")
+        matching = [
+            s
+            for s in recovered_sug
+            if int(s.get("row_id") or 0) == row_id
+            and (not field_filter or s.get("field") == field_filter)
+        ]
+        if action == "reject":
+            if not matching:
+                return _workspace_command_response(
+                    ch,
+                    f"No pending suggestion found for row **{row_id}**"
+                    + (f" ({field_filter})" if field_filter else "")
+                    + ".",
+                    {"type": "reject_row", "row_id": row_id, "applied": 0},
+                    clear_pending=False,
+                )
+            return _workspace_command_response(
+                ch,
+                f"✗ Rejected {len(matching)} suggestion(s) for row **{row_id}**.",
+                {"type": "reject_row", "row_id": row_id, "field": field_filter, "applied": len(matching)},
+                clear_pending=False,
+            )
+        if matching:
+            applied = _apply_suggestions_to_chart(ch, matching)
+            if applied:
+                return _workspace_command_response(
+                    ch,
+                    f"✓ Accepted {applied} change(s) for row **{row_id}**.",
+                    {"type": "accept_row", "row_id": row_id, "field": field_filter, "applied": applied},
+                    clear_pending=True,
+                )
+        return _workspace_command_response(
+            ch,
+            f"No pending suggestion to accept for row **{row_id}**.",
+            {"type": "accept_row", "row_id": row_id, "applied": 0},
+        )
+
+    if _user_wants_reject_new_rows(user_message):
+        if not recovered_nr:
+            return _workspace_command_response(
+                ch, "No proposed new rows to dismiss.", {"type": "reject_new_rows", "applied": 0}
+            )
+        return _workspace_command_response(
+            ch,
+            f"Dismissed {len(recovered_nr)} proposed new row(s).",
+            {"type": "reject_new_rows", "applied": len(recovered_nr)},
+            clear_pending=True,
+        )
+
+    if _user_wants_accept_new_rows(user_message):
+        if not recovered_nr:
+            return _workspace_command_response(
+                ch, "No proposed new rows to add. Ask Spark to propose a new row first.", {"type": "accept_new_rows", "applied": 0}
+            )
+        added = _apply_new_rows_to_chart(ch, recovered_nr)
+        return _workspace_command_response(
+            ch,
+            f"✓ Added {added} new row(s) to the chart (tagged **Added**).",
+            {"type": "accept_new_rows", "applied": added},
+            clear_pending=True,
+        )
+
+    if _user_wants_reject_all(user_message) and (recovered_sug or recovered_nr):
+        parts = []
+        if recovered_sug:
+            parts.append(f"{len(recovered_sug)} cell edit(s)")
+        if recovered_nr:
+            parts.append(f"{len(recovered_nr)} proposed row(s)")
+        return _workspace_command_response(
+            ch,
+            f"✗ Dismissed all pending suggestions ({', '.join(parts)}).",
+            {"type": "reject_all", "applied": len(recovered_sug) + len(recovered_nr)},
+            clear_pending=True,
+        )
+
+    if _user_wants_accept_all(user_message):
+        if recovered_sug:
+            applied = _apply_suggestions_to_chart(ch, recovered_sug)
+            if applied:
+                return _workspace_command_response(
+                    ch,
+                    f"✓ Accepted **{applied}** AI suggestion(s). The claim chart is updated.",
+                    {"type": "accept_all", "applied": applied},
+                    clear_pending=True,
+                )
+        if recovered_nr and not recovered_sug:
+            added = _apply_new_rows_to_chart(ch, recovered_nr)
+            return _workspace_command_response(
+                ch,
+                f"✓ Added **{added}** proposed row(s) to the chart.",
+                {"type": "accept_new_rows", "applied": added},
+                clear_pending=True,
+            )
+        if recovered_sug or _user_wants_accept_all(user_message):
+            if ml in ("accept", "yes", "ok", "okay", "apply", "do it", "go ahead"):
+                return _workspace_command_response(
+                    ch,
+                    "I don't see any pending suggestions to accept. Ask me to propose edits first, then say **accept all**.",
+                    {"type": "accept_all", "applied": 0},
+                )
+
+    return None
+
+
 def _recover_suggestions_from_prior_assistant(
     ch: ClaimChart, user_message: str, suggestions: List[Dict[str, Any]], new_rows: List[Dict[str, str]]
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
@@ -234,7 +705,7 @@ def _recover_suggestions_from_prior_assistant(
     """
     if suggestions:
         return suggestions, new_rows
-    if not _user_confirms_apply(user_message):
+    if not _user_confirms_apply(user_message) and not _user_wants_accept_all(user_message):
         return suggestions, new_rows
     prev = (
         ChatMessage.objects.filter(claim_chart=ch, role=ChatMessage.Role.ASSISTANT)
@@ -1391,6 +1862,9 @@ def api_claim_chart_chat(request, chart_id: int):
 
     if user_message:
         ChatMessage.objects.create(claim_chart=ch, role=ChatMessage.Role.USER, content=user_message)
+        cmd_resp = _try_workspace_command(ch, user_message)
+        if cmd_resp is not None:
+            return cmd_resp
 
     api_key = getattr(settings, "GROQ_API_KEY", "") or ""
     if not api_key or Groq is None:
@@ -1533,7 +2007,8 @@ def api_claim_chart_chat(request, chart_id: int):
 
     gated, strength_removed = _filter_suggestions_by_strength(validated, rows_by_id, user_message)
 
-    ChatMessage.objects.create(claim_chart=ch, role=ChatMessage.Role.ASSISTANT, content=assistant_content)
+    stored_content = _embed_suggestions_for_storage(assistant_content, gated, new_rows)
+    ChatMessage.objects.create(claim_chart=ch, role=ChatMessage.Role.ASSISTANT, content=stored_content)
     return JsonResponse(
         {
             "ok": True,

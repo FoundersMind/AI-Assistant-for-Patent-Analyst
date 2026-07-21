@@ -1271,6 +1271,7 @@
                 <tr><td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>Z</kbd></td><td>Redo</td></tr>
                 <tr><td><kbd>Ctrl</kbd> + <kbd>F</kbd></td><td>Focus row search</td></tr>
                 <tr><td><kbd>A</kbd></td><td>Accept all pending suggestions</td></tr>
+                <tr><td>Type <strong>accept</strong> / <strong>reject all</strong></td><td>Chat commands (same as buttons)</td></tr>
                 <tr><td><kbd>Esc</kbd></td><td>Reject all pending suggestions</td></tr>
                 <tr><td><kbd>?</kbd></td><td>Show this help</td></tr>
               </tbody>
@@ -1491,19 +1492,22 @@
 
         function parseEmbeddedSuggestions(raw) {
           const i = (raw || "").indexOf(LUMENCI_SUG_START);
-          if (i === -1) return { prose: raw || "", suggestions: null };
+          if (i === -1) return { prose: raw || "", suggestions: null, newRows: null };
           const j = raw.indexOf(LUMENCI_SUG_END, i);
-          if (j === -1) return { prose: raw || "", suggestions: null };
+          if (j === -1) return { prose: raw || "", suggestions: null, newRows: null };
           const prose = raw.slice(0, i).trimEnd();
           let suggestions = null;
+          let newRows = null;
           try {
             const payload = JSON.parse(decodeURIComponent(raw.slice(i + LUMENCI_SUG_START.length, j)));
             if (payload && Array.isArray(payload.suggestions)) suggestions = payload.suggestions;
+            if (payload && Array.isArray(payload.new_rows)) newRows = payload.new_rows;
           } catch {
             suggestions = null;
+            newRows = null;
           }
           const tail = raw.slice(j + LUMENCI_SUG_END.length).trim();
-          return { prose, suggestions, tail };
+          return { prose, suggestions, tail, newRows };
         }
 
         function renderAssistantBubbleHtml(raw) {
@@ -2200,8 +2204,15 @@
         }
 
         function userWantsApplyViaChat(text) {
+          return isAcceptChatCommand(text);
+        }
+
+        function isAcceptChatCommand(text) {
           const ml = (text || "").trim().toLowerCase();
           if (!ml || ml.length > 200) return false;
+          if (ml === "accept" || ml === "yes" || ml === "ok" || ml === "okay" || ml === "approve" || ml === "approved") {
+            return true;
+          }
           const triggers = [
             "do it",
             "please do",
@@ -2212,6 +2223,10 @@
             "apply",
             "apply it",
             "apply that",
+            "apply all",
+            "accept all",
+            "accept them",
+            "accept those",
             "go ahead",
             "implement",
             "update the table",
@@ -2222,8 +2237,188 @@
             "do that",
             "proceed",
             "commit",
+            "looks good",
+            "sounds good",
+            "go with it",
           ];
           return triggers.some((t) => ml.includes(t));
+        }
+
+        function isRejectChatCommand(text) {
+          const ml = (text || "").trim().toLowerCase();
+          if (!ml || ml.length > 200) return false;
+          if (ml === "reject" || ml === "no" || ml === "nope" || ml === "decline" || ml === "dismiss") return true;
+          return ["reject all", "reject everything", "dismiss all", "discard all", "reject them", "no thanks", "skip"].some(
+            (t) => ml.includes(t)
+          );
+        }
+
+        function isWorkspaceChatCommand(text) {
+          const ml = (text || "").trim().toLowerCase();
+          if (!ml) return false;
+          if (ml === "undo" || ml === "redo" || ml === "undo last change" || ml === "redo last change") return true;
+          if (/^(accept|reject|approve|dismiss)\b/i.test(ml)) return true;
+          if (isAcceptChatCommand(ml) || isRejectChatCommand(ml)) return true;
+          if (/accept new row|reject new row|proposed row|reassess|re-assess|refresh strength/i.test(ml)) return true;
+          return false;
+        }
+
+        function parseRowChatCommand(text) {
+          const m = (text || "").match(
+            /\b(accept|reject|approve|dismiss)\b\s+(?:the\s+)?(?:row\s+|element\s+)?#?(\d+)(?:\s+[-:]?\s*(claim|evidence|reasoning))?/i
+          );
+          if (!m) return null;
+          return {
+            action: m[1].toLowerCase() === "accept" || m[1].toLowerCase() === "approve" ? "accept" : "reject",
+            rowId: Number(m[2]),
+            field: (m[3] || "").toLowerCase() || null,
+          };
+        }
+
+        function recoverPendingFromChatHistory() {
+          const chat = (state.activeChart && state.activeChart.chat) || [];
+          for (let i = chat.length - 1; i >= 0; i--) {
+            if (chat[i].role !== "assistant") continue;
+            const { suggestions, newRows } = parseEmbeddedSuggestions(chat[i].content || "");
+            if (suggestions && suggestions.length) {
+              ui.pendingSuggestions = suggestions.map((s) => ({
+                row_id: Number(s.row_id),
+                field: s.field,
+                old_text: s.old_text,
+                new_text: s.new_text,
+              }));
+            }
+            if (newRows && newRows.length) {
+              ui.pendingNewRows = newRows.map((x) => ({
+                claim: x.claim || "",
+                evidence: x.evidence || "",
+                reasoning: x.reasoning || "",
+              }));
+            }
+            if ((suggestions && suggestions.length) || (newRows && newRows.length)) break;
+          }
+        }
+
+        function recoverSuggestionsFromChatHistory() {
+          recoverPendingFromChatHistory();
+          return ui.pendingSuggestions;
+        }
+
+        function handleWorkspaceCommandResponse(data) {
+          const cmd = data.workspace_command;
+          if (!cmd) return;
+          if (!ui.pendingSuggestions.length && !ui.pendingNewRows.length) {
+            recoverPendingFromChatHistory();
+          }
+          if (data.clear_pending) {
+            ui.pendingSuggestions = [];
+            ui.pendingNewRows = [];
+          } else if (cmd.type === "reject_row") {
+            ui.pendingSuggestions = ui.pendingSuggestions.filter(
+              (s) => !(s.row_id === cmd.row_id && (!cmd.field || s.field === cmd.field))
+            );
+            if (!ui.pendingSuggestions.length) ui.activeRowId = null;
+          } else if (cmd.type === "reject_all") {
+            ui.pendingSuggestions = [];
+            ui.pendingNewRows = [];
+            ui.activeRowId = null;
+          }
+          renderTable();
+          renderChat();
+          syncUndoRedoButtons();
+          refreshChangeLog();
+          renderAdminPanel();
+          if (cmd.type === "accept_all" && cmd.applied) toast(`✓ ${cmd.applied} change(s) accepted`);
+          else if (cmd.type === "accept_row" && cmd.applied) toast(`✓ Row ${cmd.row_id} updated`);
+          else if (cmd.type === "reject_all") toast("✗ Suggestions dismissed");
+          else if (cmd.type === "undo") toast("↩ Undone");
+          else if (cmd.type === "redo") toast("↪ Redone");
+          else if (cmd.type === "reassess_strengths") toast("Strength badges updated");
+        }
+
+        async function tryLocalChatCommand(msg) {
+          if (!isWorkspaceChatCommand(msg)) return false;
+
+          const ml = msg.toLowerCase();
+          if (ml === "undo" || ml === "undo last change") {
+            undoLastChange();
+            return true;
+          }
+          if (ml === "redo" || ml === "redo last change") {
+            redoLastChange();
+            return true;
+          }
+
+          if (!ui.pendingSuggestions.length) {
+            const recovered = recoverSuggestionsFromChatHistory();
+            if (recovered.length) ui.pendingSuggestions = recovered;
+          }
+
+          const rowCmd = parseRowChatCommand(msg);
+          if (rowCmd && ui.pendingSuggestions.length) {
+            const matching = ui.pendingSuggestions.filter(
+              (s) => s.row_id === rowCmd.rowId && (!rowCmd.field || s.field === rowCmd.field)
+            );
+            if (rowCmd.action === "reject" && matching.length) {
+              ui.pendingSuggestions = ui.pendingSuggestions.filter(
+                (s) => !(s.row_id === rowCmd.rowId && (!rowCmd.field || s.field === rowCmd.field))
+              );
+              renderTable();
+              renderChat();
+              toast(`✗ Rejected ${matching.length} suggestion(s) for row ${rowCmd.rowId}`);
+              return true;
+            }
+            if (rowCmd.action === "accept" && matching.length === 1) {
+              await applySuggestion(matching[0]);
+              return true;
+            }
+            if (rowCmd.action === "accept" && matching.length > 1) {
+              const batch = matching.map((s) => ({ ...s }));
+              const data = await apiPostJson(`/api/claim-charts/${state.activeChartId}/suggestions/apply-bulk`, {
+                suggestions: batch,
+              });
+              if (!data.ok) return false;
+              state.activeChart = data.claim_chart;
+              ui.pendingSuggestions = ui.pendingSuggestions.filter(
+                (s) => !matching.some((m) => m.row_id === s.row_id && m.field === s.field)
+              );
+              renderTable();
+              renderChat();
+              syncUndoRedoButtons();
+              refreshChangeLog();
+              toast(`✓ Accepted ${data.applied || batch.length} change(s) for row ${rowCmd.rowId}`);
+              return true;
+            }
+          }
+
+          if (isRejectChatCommand(msg) && ui.pendingSuggestions.length) {
+            rejectAllSuggestions();
+            return true;
+          }
+
+          if (isAcceptChatCommand(msg) && ui.pendingSuggestions.length) {
+            await acceptAllSuggestions();
+            return true;
+          }
+
+          if (/accept new row|add proposed row|add the row/i.test(ml) && ui.pendingNewRows.length) {
+            for (let i = ui.pendingNewRows.length - 1; i >= 0; i--) applyNewRow(i);
+            return true;
+          }
+
+          if (/reject new row|dismiss proposed/i.test(ml) && ui.pendingNewRows.length) {
+            ui.pendingNewRows = [];
+            renderTable();
+            toast("Proposed rows dismissed");
+            return true;
+          }
+
+          if (/reassess|re-assess|refresh strength/i.test(ml)) {
+            await reassessAllStrengths();
+            return true;
+          }
+
+          return false;
         }
 
         function clearPendingSuggestion() {
@@ -2314,6 +2509,7 @@
           el.chatInput.value = "";
           autoExpandTextarea(el.chatInput);
           clearPendingSuggestion();
+          recoverPendingFromChatHistory();
           renderChartSelect();
           saveWorkspacePrefs();
           renderDocs();
@@ -2443,9 +2639,14 @@
           const msg = (message || "").trim();
           if (!msg) return;
           if (!state.activeChartId) return toast("Upload/select a claim chart first");
-          const ml = msg.toLowerCase();
-          if (ml === "undo" || ml === "undo last change") return undoLastChange();
-          if (ml === "redo" || ml === "redo last change") return redoLastChange();
+
+          if (await tryLocalChatCommand(msg)) {
+            const chat = [...(state.activeChart.chat || [])];
+            chat.push({ role: "user", content: msg, ts: Date.now() });
+            state.activeChart.chat = chat;
+            renderChat();
+            return;
+          }
 
           maybeHighlightFromText(msg);
           showTyping(false);
@@ -2466,6 +2667,13 @@
             syncUndoRedoButtons();
             refreshChangeLog();
             renderAdminPanel();
+
+            if (data.workspace_command) {
+              handleWorkspaceCommandResponse(data);
+              renderChat();
+              return;
+            }
+
             renderChat();
 
             const sg = data.strength_gate;
@@ -2496,7 +2704,7 @@
               });
               assistantWithCard =
                 assistantText +
-                "\n\n**Suggested edits** — review the before/after cards below, then **Accept** or **Reject** on each card (or in the chart).\n" +
+                "\n\n**Suggested edits** — say **accept all**, **accept row N**, or **reject all**, or use the buttons on each card.\n" +
                 lines.join("\n") +
                 "\n" +
                 LUMENCI_SUG_START +
@@ -2507,7 +2715,7 @@
             if (newRows.length) {
               assistantWithCard +=
                 "\n\n**Proposed new row(s)** — shown at the bottom of the claim chart with a **Proposed new** tag. " +
-                "Click **Accept (add row)** to insert them permanently as **Added** (distinct from **Original** upload rows).";
+                "Click **Accept (add row)** or say **accept new row** to insert them permanently as **Added** (distinct from **Original** upload rows).";
               ui.pendingNewRows = newRows.map((x) => ({
                 claim: x.claim || "",
                 evidence: x.evidence || "",
@@ -2539,13 +2747,17 @@
               }));
               renderPendingBar();
               setActiveRow(ui.pendingSuggestions[0].row_id);
-              if (suggestions.length === 1 && userWantsApplyViaChat(msg)) {
-                applySuggestion({
-                  row_id: Number(suggestions[0].row_id),
-                  field: suggestions[0].field,
-                  old_text: suggestions[0].old_text,
-                  new_text: suggestions[0].new_text,
-                });
+              if (userWantsApplyViaChat(msg)) {
+                if (suggestions.length === 1) {
+                  applySuggestion({
+                    row_id: Number(suggestions[0].row_id),
+                    field: suggestions[0].field,
+                    old_text: suggestions[0].old_text,
+                    new_text: suggestions[0].new_text,
+                  });
+                } else {
+                  acceptAllSuggestions();
+                }
               }
             }
           } catch {
