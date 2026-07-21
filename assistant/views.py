@@ -20,7 +20,11 @@ from openpyxl import Workbook
 from .agent import execute_agent_actions, infer_actions_from_user_message, parse_agent_payload
 from .models import Case, ChatMessage, ClaimChart, ClaimChartRow, ProductDoc, RowChange
 from .parsing import ParseError, extract_product_doc_text, parse_claim_chart
-from .strength_llm import sync_claim_chart_strengths, sync_one_row_strength
+from .strength_llm import (
+    dedupe_strength_judgments,
+    sync_claim_chart_strengths,
+    sync_one_row_strength,
+)
 from docx import Document
 
 try:
@@ -135,6 +139,9 @@ STRENGTH_POLICY = (
     'return {\"suggestions\": [], \"new_rows\": []}, and do not fabricate weaknesses.\n'
     "- Do not rewrite strong rows “just in case”; optional improvements belong in plain-language prose only, "
     "without suggestion JSON, unless the analyst opted into alternates as above.\n"
+    "- Strength badges are reassessed automatically after accepted edits. If a row stays weak or missing, "
+    "tell the analyst their change was applied but AI judgment still finds the evidence thin or incomplete—not "
+    "that the edit failed.\n"
 )
 
 
@@ -424,11 +431,12 @@ def _user_wants_reassess(msg: str) -> bool:
     )
 
 
-def _apply_suggestions_to_chart(ch: ClaimChart, suggestions: List[Dict[str, Any]]) -> int:
+def _apply_suggestions_to_chart(ch: ClaimChart, suggestions: List[Dict[str, Any]]) -> Tuple[int, List[Dict[str, Any]]]:
     if not suggestions:
-        return 0
+        return 0, []
     _invalidate_redo_branch(ch)
     applied = 0
+    raw_judgments: List[Dict[str, Any]] = []
     with transaction.atomic():
         for suggestion in suggestions:
             if not isinstance(suggestion, dict):
@@ -462,9 +470,9 @@ def _apply_suggestions_to_chart(ch: ClaimChart, suggestions: List[Dict[str, Any]
             else:
                 row.reasoning_text = new_text
             row.save(update_fields=["claim_text", "evidence_text", "reasoning_text"])
-            sync_one_row_strength(row)
+            raw_judgments.append(sync_one_row_strength(row))
             applied += 1
-    return applied
+    return applied, dedupe_strength_judgments(raw_judgments)
 
 
 def _apply_new_rows_to_chart(ch: ClaimChart, new_rows: List[Dict[str, str]]) -> int:
@@ -522,6 +530,7 @@ def _build_agent_json_response(
     highlight_row_id: Optional[int] = None,
     client_hints: Optional[List[Dict[str, Any]]] = None,
     strength_gate: Optional[Dict[str, Any]] = None,
+    strength_judgments: Optional[List[Dict[str, Any]]] = None,
     workspace_command: Optional[Dict[str, Any]] = None,
 ) -> JsonResponse:
     sug = suggestions or []
@@ -538,6 +547,7 @@ def _build_agent_json_response(
             "new_rows": nr,
             "claim_chart": _chart_to_dict(ch),
             "strength_gate": sg,
+            "strength_judgments": strength_judgments or [],
             "executed_actions": executed_actions or [],
             "clear_pending": clear_pending,
             "highlight_row_id": highlight_row_id,
@@ -573,6 +583,7 @@ def _try_workspace_command(ch: ClaimChart, user_message: str) -> Optional[JsonRe
         clear_pending=report["clear_pending"],
         highlight_row_id=report["highlight_row_id"],
         client_hints=report["client_hints"],
+        strength_judgments=report.get("strength_judgments") or [],
         workspace_command=primary,
     )
 
@@ -1031,10 +1042,13 @@ def api_claim_chart_row_update(request, chart_id: int):
     if upd:
         row.save(update_fields=upd)
     run_llm_strength = st not in ("strong", "weak", "missing")
-    if run_llm_strength:
-        sync_one_row_strength(row)
+    strength_judgments: List[Dict[str, Any]] = []
+    if run_llm_strength and manual_changes:
+        strength_judgments = dedupe_strength_judgments([sync_one_row_strength(row)])
     ch = ClaimChart.objects.prefetch_related("rows", "chat_messages").get(pk=ch.pk)
-    return JsonResponse({"ok": True, "claim_chart": _chart_to_dict(ch)})
+    return JsonResponse(
+        {"ok": True, "claim_chart": _chart_to_dict(ch), "strength_judgments": strength_judgments}
+    )
 
 
 @require_POST
@@ -1499,46 +1513,17 @@ def api_claim_chart_apply_suggestions_bulk(request, chart_id: int):
     if not isinstance(suggestions, list) or not suggestions:
         return JsonResponse({"ok": False, "error": "suggestions list required"}, status=400)
 
-    _invalidate_redo_branch(ch)
-    applied = 0
-    with transaction.atomic():
-        for suggestion in suggestions:
-            if not isinstance(suggestion, dict):
-                continue
-            row_id = int(suggestion.get("row_id") or 0)
-            field = suggestion.get("field")
-            new_text = suggestion.get("new_text") or ""
-            if row_id <= 0 or field not in ("claim", "evidence", "reasoning"):
-                continue
-            row = ClaimChartRow.objects.filter(claim_chart=ch, row_index=row_id).first()
-            if not row:
-                continue
-            old_text = (
-                row.claim_text
-                if field == "claim"
-                else row.evidence_text
-                if field == "evidence"
-                else row.reasoning_text
-            )
-            RowChange.objects.create(
-                claim_chart=ch,
-                row_index=row_id,
-                field=field,
-                old_text=old_text,
-                new_text=new_text,
-            )
-            if field == "claim":
-                row.claim_text = new_text
-            elif field == "evidence":
-                row.evidence_text = new_text
-            else:
-                row.reasoning_text = new_text
-            row.save(update_fields=["claim_text", "evidence_text", "reasoning_text"])
-            sync_one_row_strength(row)
-            applied += 1
+    applied, strength_judgments = _apply_suggestions_to_chart(ch, suggestions)
 
     ch = ClaimChart.objects.prefetch_related("rows", "chat_messages").get(pk=ch.pk)
-    return JsonResponse({"ok": True, "applied": applied, "claim_chart": _chart_to_dict(ch)})
+    return JsonResponse(
+        {
+            "ok": True,
+            "applied": applied,
+            "claim_chart": _chart_to_dict(ch),
+            "strength_judgments": strength_judgments,
+        }
+    )
 
 
 @require_POST
@@ -1583,9 +1568,12 @@ def api_claim_chart_apply_suggestion(request, chart_id: int):
                 evidence_text=evidence,
                 reasoning_text=reasoning,
             )
-        sync_one_row_strength(new_row)
+        judgment = sync_one_row_strength(new_row)
+        strength_judgments = dedupe_strength_judgments([judgment])
         ch = ClaimChart.objects.prefetch_related("rows", "chat_messages").get(pk=ch.pk)
-        return JsonResponse({"ok": True, "claim_chart": _chart_to_dict(ch)})
+        return JsonResponse(
+            {"ok": True, "claim_chart": _chart_to_dict(ch), "strength_judgments": strength_judgments}
+        )
 
     row_id = int(suggestion.get("row_id") or 0)
     field = suggestion.get("field")
@@ -1614,9 +1602,12 @@ def api_claim_chart_apply_suggestion(request, chart_id: int):
             row.reasoning_text = new_text
         row.save(update_fields=["claim_text", "evidence_text", "reasoning_text"])
 
-    sync_one_row_strength(row)
+    judgment = sync_one_row_strength(row)
+    strength_judgments = dedupe_strength_judgments([judgment])
     ch = ClaimChart.objects.prefetch_related("rows", "chat_messages").get(pk=ch.pk)
-    return JsonResponse({"ok": True, "claim_chart": _chart_to_dict(ch)})
+    return JsonResponse(
+        {"ok": True, "claim_chart": _chart_to_dict(ch), "strength_judgments": strength_judgments}
+    )
 
 
 @require_POST
@@ -1925,6 +1916,7 @@ def api_claim_chart_chat(request, chart_id: int):
         clear_pending=agent_report["clear_pending"],
         highlight_row_id=agent_report["highlight_row_id"],
         client_hints=agent_report["client_hints"],
+        strength_judgments=agent_report.get("strength_judgments") or [],
         strength_gate={"removed": strength_removed, "removed_count": len(strength_removed)},
         workspace_command=agent_report["executed_actions"][-1] if agent_report["executed_actions"] else None,
     )

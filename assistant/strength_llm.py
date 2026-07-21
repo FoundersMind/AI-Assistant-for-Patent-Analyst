@@ -193,9 +193,13 @@ def sync_claim_chart_strengths(ch) -> None:
         ClaimChartRow.objects.bulk_update(updated, ["strength"], batch_size=50)
 
 
-def sync_one_row_strength(row) -> None:
-    """Re-assess a single ClaimChartRow after edit."""
+def sync_one_row_strength(row) -> Dict[str, Any]:
+    """Re-assess a single ClaimChartRow after edit. Returns before/after strength metadata."""
     from .models import ClaimChartRow
+
+    previous = (row.strength or ClaimChartRow.Strength.WEAK).strip().lower()
+    if previous not in VALID_STRENGTHS:
+        previous = "weak"
 
     by_id = assess_rows_with_groq(
         [
@@ -208,6 +212,76 @@ def sync_one_row_strength(row) -> None:
         ]
     )
     s = by_id.get(row.row_index)
+    new = s if s in VALID_STRENGTHS else previous
     if s in VALID_STRENGTHS:
         ClaimChartRow.objects.filter(pk=row.pk).update(strength=s)
         row.strength = s
+    return {
+        "row_id": row.row_index,
+        "previous_strength": previous,
+        "new_strength": new,
+        "unchanged": previous == new,
+    }
+
+
+_STRENGTH_RANK = {"missing": 0, "weak": 1, "strong": 2}
+
+
+def format_strength_judgment(judgment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build a user-facing note when strength is reassessed after an edit."""
+    if not isinstance(judgment, dict):
+        return None
+    try:
+        row_id = int(judgment.get("row_id"))
+    except (TypeError, ValueError):
+        return None
+    prev = str(judgment.get("previous_strength") or "weak").lower()
+    new = str(judgment.get("new_strength") or "weak").lower()
+    if prev not in VALID_STRENGTHS:
+        prev = "weak"
+    if new not in VALID_STRENGTHS:
+        new = "weak"
+
+    out = {
+        "row_id": row_id,
+        "previous_strength": prev,
+        "new_strength": new,
+        "unchanged": prev == new,
+    }
+
+    if prev == new:
+        if new == "weak":
+            out["message"] = (
+                f"Row {row_id}: your edit was saved, but strength stays Weak. "
+                "That is AI judgment—the evidence may still be thin or not clearly mapped to the claim. "
+                "Add technical detail or override strength manually if you disagree."
+            )
+            return out
+        if new == "missing":
+            out["message"] = (
+                f"Row {row_id}: your edit was saved, but strength stays Missing. "
+                "AI judgment: substantive evidence for this claim element is still lacking."
+            )
+            return out
+        return None
+
+    if new == "strong" and _STRENGTH_RANK.get(prev, 0) < _STRENGTH_RANK["strong"]:
+        out["improved"] = True
+        out["message"] = f"Row {row_id}: strength upgraded to Strong after your edit."
+        return out
+
+    if _STRENGTH_RANK.get(new, 0) < _STRENGTH_RANK.get(prev, 0):
+        out["improved"] = False
+        out["message"] = f"Row {row_id}: edit saved; strength reassessed as {new.title()}."
+        return out
+    return None
+
+
+def dedupe_strength_judgments(judgments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep the latest judgment per row; drop rows that need no user message."""
+    by_row: Dict[int, Dict[str, Any]] = {}
+    for raw in judgments or []:
+        formatted = format_strength_judgment(raw)
+        if formatted:
+            by_row[int(formatted["row_id"])] = formatted
+    return list(by_row.values())

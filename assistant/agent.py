@@ -14,7 +14,7 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 
 from .models import Case, ChatMessage, ClaimChart, ClaimChartRow, RowChange
-from .strength_llm import sync_claim_chart_strengths, sync_one_row_strength
+from .strength_llm import dedupe_strength_judgments, sync_claim_chart_strengths, sync_one_row_strength
 
 VALID_ACTION_TYPES = frozenset(
     {
@@ -114,11 +114,18 @@ def _invalidate_redo_branch(ch: ClaimChart) -> None:
     RowChange.objects.filter(claim_chart=ch, is_undone=True).update(redo_invalidated=True)
 
 
-def _apply_suggestions(ch: ClaimChart, suggestions: List[Dict[str, Any]]) -> int:
+def _merge_strength_judgments(bucket: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> None:
+    merged = dedupe_strength_judgments(bucket + (incoming or []))
+    bucket.clear()
+    bucket.extend(merged)
+
+
+def _apply_suggestions(ch: ClaimChart, suggestions: List[Dict[str, Any]]) -> Tuple[int, List[Dict[str, Any]]]:
     if not suggestions:
-        return 0
+        return 0, []
     _invalidate_redo_branch(ch)
     applied = 0
+    raw_judgments: List[Dict[str, Any]] = []
     with transaction.atomic():
         for suggestion in suggestions:
             row_id = int(suggestion.get("row_id") or 0)
@@ -150,9 +157,9 @@ def _apply_suggestions(ch: ClaimChart, suggestions: List[Dict[str, Any]]) -> int
             else:
                 row.reasoning_text = new_text
             row.save(update_fields=["claim_text", "evidence_text", "reasoning_text"])
-            sync_one_row_strength(row)
+            raw_judgments.append(sync_one_row_strength(row))
             applied += 1
-    return applied
+    return applied, dedupe_strength_judgments(raw_judgments)
 
 
 def _apply_new_rows(ch: ClaimChart, new_rows: List[Dict[str, str]]) -> int:
@@ -290,6 +297,7 @@ def execute_agent_actions(
     clear_pending = False
     highlight_row_id: Optional[int] = None
     client_hints: List[Dict[str, Any]] = []
+    strength_judgments: List[Dict[str, Any]] = []
     messages: List[str] = []
 
     for action in actions:
@@ -347,7 +355,8 @@ def execute_agent_actions(
 
         if t == "accept_all":
             pool = pending_suggestions or recovered_suggestions
-            applied = _apply_suggestions(ch, pool)
+            applied, judgments = _apply_suggestions(ch, pool)
+            _merge_strength_judgments(strength_judgments, judgments)
             added = 0
             if pending_new_rows or recovered_new_rows:
                 added = _apply_new_rows(ch, pending_new_rows or recovered_new_rows)
@@ -367,7 +376,8 @@ def execute_agent_actions(
                 pool = explicit
             else:
                 pool = pending_suggestions or recovered_suggestions
-            applied = _apply_suggestions(ch, pool)
+            applied, judgments = _apply_suggestions(ch, pool)
+            _merge_strength_judgments(strength_judgments, judgments)
             if applied:
                 clear_pending = True
                 pending_suggestions = []
@@ -402,7 +412,8 @@ def execute_agent_actions(
                 for s in pool
                 if int(s.get("row_id") or 0) == row_id and (not field or s.get("field") == field)
             ]
-            applied = _apply_suggestions(ch, matching)
+            applied, judgments = _apply_suggestions(ch, matching)
+            _merge_strength_judgments(strength_judgments, judgments)
             pending_suggestions = [s for s in pending_suggestions if s not in matching]
             recovered_suggestions = [s for s in recovered_suggestions if s not in matching]
             highlight_row_id = row_id
@@ -461,7 +472,8 @@ def execute_agent_actions(
                 else:
                     row.reasoning_text = text
                 row.save(update_fields=["claim_text", "evidence_text", "reasoning_text"])
-            sync_one_row_strength(row)
+            judgment = sync_one_row_strength(row)
+            _merge_strength_judgments(strength_judgments, dedupe_strength_judgments([judgment]))
             highlight_row_id = row_id
             messages.append(f"Updated row {row_id} {field}.")
             executed.append({"type": t, "row_id": row_id, "field": field, "ok": True})
@@ -566,6 +578,7 @@ def execute_agent_actions(
         "clear_pending": clear_pending,
         "highlight_row_id": highlight_row_id,
         "client_hints": client_hints,
+        "strength_judgments": strength_judgments,
         "chart": ch,
         "remaining_suggestions": pending_suggestions + recovered_suggestions,
         "remaining_new_rows": pending_new_rows + recovered_new_rows,

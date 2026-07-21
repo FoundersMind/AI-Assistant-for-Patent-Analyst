@@ -150,7 +150,37 @@
       .chrome-actions .btn-link{ padding:2px 6px !important; font-size:11px !important; }
       .panel-title{ font-weight:800; color:var(--primary); display:flex; align-items:center; gap:8px; }
 
-      .claim-scroll{ overflow:auto; flex:1 1 auto; min-height:0; background:var(--surface); }
+      .claim-scroll{ position:relative; overflow:auto; flex:1 1 auto; min-height:0; background:var(--surface); }
+      .claim-upload-overlay{
+        position:absolute; inset:0; z-index:5;
+        display:flex; align-items:center; justify-content:center;
+        background:rgba(248,250,252,.92);
+        backdrop-filter:blur(2px);
+      }
+      .claim-upload-overlay.d-none{ display:none !important; }
+      .claim-upload-card{
+        text-align:center; max-width:300px; padding:24px 20px;
+        border:1px solid #e2e8f0; border-radius:12px; background:#fff;
+        box-shadow:0 8px 24px rgba(15,23,42,.08);
+      }
+      .upload-overlay-title{ font-weight:700; font-size:14px; color:var(--primary); margin-top:12px; margin-bottom:4px; }
+      .upload-overlay-detail{ font-size:12px; color:#64748b; }
+      .upload-spinner{ width:2rem; height:2rem; }
+      .upload-status-badge{
+        font-size:10px; animation:upload-pulse 1.4s ease-in-out infinite;
+      }
+      @keyframes upload-pulse{
+        0%,100%{ opacity:1; }
+        50%{ opacity:.65; }
+      }
+      .workspace-upload-bar{
+        display:flex; align-items:center; gap:8px;
+        padding:6px 12px; font-size:12px; font-weight:600; color:#1e40af;
+        background:#eff6ff; border-bottom:1px solid #bfdbfe;
+      }
+      .workspace-upload-bar.d-none{ display:none !important; }
+      .upload-table-placeholder{ text-align:center; padding:48px 16px !important; color:#64748b; vertical-align:middle !important; }
+      .upload-table-placeholder-inner{ display:inline-flex; align-items:center; gap:10px; justify-content:center; }
       .claim-table{ margin:0; table-layout:fixed; width:100%; }
       .claim-table thead th{
         position:sticky; top:0; z-index:2;
@@ -253,6 +283,10 @@
       .claim-row[data-strength="strong"] .row-strength-mini .dot{ background:var(--success); }
       .claim-row[data-strength="weak"] .row-strength-mini .dot{ background:#ffc107; }
       .claim-row[data-strength="missing"] .row-strength-mini .dot{ background:var(--danger); }
+      .row-strength-mini.has-judgment-hint{
+        outline:1px dashed #f59e0b;
+        box-shadow:0 0 0 2px rgba(245,158,11,.15);
+      }
       .row-edit-btn{
         width:26px;
         height:26px;
@@ -865,6 +899,7 @@
               <span class="chrome-heading-eyebrow">Chart</span>
               <span class="chrome-heading-title">Claim chart</span>
               <span id="rowCountBadge" class="badge rounded-pill text-bg-light border border-secondary-subtle fw-semibold" style="font-size:10px">0 rows</span>
+              <span id="uploadStatusBadge" class="badge rounded-pill text-bg-primary upload-status-badge d-none" aria-live="polite">Uploading…</span>
             </div>
             <div class="chrome-matter">
               <span class="chrome-matter-label" id="matterLabel">Matter</span>
@@ -919,6 +954,13 @@
         </div>
 
         <div id="claimScroll" class="claim-scroll">
+          <div id="claimUploadOverlay" class="claim-upload-overlay d-none" aria-live="polite" aria-busy="true">
+            <div class="claim-upload-card">
+              <div class="spinner-border text-primary upload-spinner" role="status" aria-hidden="true"></div>
+              <p id="uploadOverlayTitle" class="upload-overlay-title">Uploading claim chart…</p>
+              <p id="uploadOverlayDetail" class="upload-overlay-detail"></p>
+            </div>
+          </div>
           <table id="claimTable" class="table claim-table table-hover align-top density-compact">
             <thead>
               <tr>
@@ -952,6 +994,10 @@
                 <i class="bi bi-chevron-down small workspace-chevron ms-1" aria-hidden="true"></i>
               </button>
             </div>
+          </div>
+          <div id="workspaceUploadBar" class="workspace-upload-bar d-none" role="status" aria-live="polite">
+            <span class="spinner-border spinner-border-sm text-primary" role="status" aria-hidden="true"></span>
+            <span id="workspaceUploadText">Uploading document…</span>
           </div>
           <div class="workspace-mini-bar">
             <span
@@ -1195,6 +1241,7 @@
                   <option value="weak">Weak</option>
                   <option value="missing">Missing</option>
                 </select>
+                <div class="form-text">Auto-assess uses AI judgment on evidence quality—not wording alone. Override manually if you disagree.</div>
               </div>
               <div class="col-md-6">
                 <label class="form-label small fw-semibold" for="rowEditOrigin">Origin</label>
@@ -1332,7 +1379,10 @@
           rowSearchQuery: "",
           pendingDocChartId: null,
           pendingUrlChartId: null,
+          upload: { active: false, kind: "", title: "", detail: "", fileName: "", token: 0 },
+          strengthJudgmentHints: {},
         };
+        let uploadStepTimeouts = [];
         const el = {
           claimTbody: document.getElementById("claimChartTbody"),
           claimTable: document.getElementById("claimTable"),
@@ -1399,6 +1449,13 @@
           docPreviewMeta: document.getElementById("docPreviewMeta"),
           docPreviewBody: document.getElementById("docPreviewBody"),
           welcomeModal: document.getElementById("welcomeModal"),
+          uploadStatusBadge: document.getElementById("uploadStatusBadge"),
+          claimUploadOverlay: document.getElementById("claimUploadOverlay"),
+          uploadOverlayTitle: document.getElementById("uploadOverlayTitle"),
+          uploadOverlayDetail: document.getElementById("uploadOverlayDetail"),
+          workspaceUploadBar: document.getElementById("workspaceUploadBar"),
+          workspaceUploadText: document.getElementById("workspaceUploadText"),
+          claimScroll: document.getElementById("claimScroll"),
         };
 
         const rowEditModalBs = () => bootstrap.Modal.getOrCreateInstance(el.rowEditModal);
@@ -1609,14 +1666,111 @@
             opt.textContent = ch.name;
             el.chartSelect.appendChild(opt);
           });
-          el.chartSelect.disabled = false;
+          el.chartSelect.disabled = ui.upload.active;
           if (state.activeChartId != null) el.chartSelect.value = String(state.activeChartId);
         }
 
+        function clearUploadStepTimeouts() {
+          uploadStepTimeouts.forEach((t) => clearTimeout(t));
+          uploadStepTimeouts = [];
+        }
+
+        function setUploadState(active, opts = {}) {
+          if (active) {
+            ui.upload = {
+              active: true,
+              kind: opts.kind || "",
+              title: opts.title || "Working…",
+              detail: opts.detail || "",
+              fileName: opts.fileName || "",
+              token: opts.token != null ? opts.token : ui.upload.token,
+            };
+          } else {
+            clearUploadStepTimeouts();
+            ui.upload = { active: false, kind: "", title: "", detail: "", fileName: "", token: ui.upload.token };
+          }
+
+          const badgeText = opts.badge || opts.title || "Working…";
+          if (el.uploadStatusBadge) {
+            el.uploadStatusBadge.classList.toggle("d-none", !active);
+            if (active) el.uploadStatusBadge.textContent = badgeText.replace(/…$/, "");
+          }
+          if (el.claimUploadOverlay) {
+            el.claimUploadOverlay.classList.toggle("d-none", !(active && ui.upload.kind === "chart"));
+            el.claimUploadOverlay.setAttribute("aria-busy", active && ui.upload.kind === "chart" ? "true" : "false");
+          }
+          if (el.uploadOverlayTitle && active && ui.upload.kind === "chart") {
+            el.uploadOverlayTitle.textContent = ui.upload.title;
+          }
+          if (el.uploadOverlayDetail) {
+            const parts = [];
+            if (ui.upload.fileName) parts.push(ui.upload.fileName);
+            if (ui.upload.detail) parts.push(ui.upload.detail);
+            el.uploadOverlayDetail.textContent = parts.join(" · ");
+          }
+          if (el.workspaceUploadBar) {
+            const showWorkspace = active && (ui.upload.kind === "doc" || ui.upload.kind === "url");
+            el.workspaceUploadBar.classList.toggle("d-none", !showWorkspace);
+          }
+          if (el.workspaceUploadText && active && (ui.upload.kind === "doc" || ui.upload.kind === "url")) {
+            el.workspaceUploadText.textContent = ui.upload.title;
+          }
+          if (el.composerAttachBtn) el.composerAttachBtn.disabled = active;
+          if (el.sendBtn) el.sendBtn.disabled = active;
+          if (el.claimScroll) el.claimScroll.setAttribute("aria-busy", active && ui.upload.kind === "chart" ? "true" : "false");
+          syncToolbarEnabled();
+          if (active && ui.upload.kind === "chart") renderTable();
+        }
+
+        function beginChartUpload(fileName) {
+          const token = ++ui.upload.token;
+          const ext = (fileName.split(".").pop() || "").toLowerCase();
+          const isHeavy = ["pdf", "png", "jpg", "jpeg", "webp"].includes(ext);
+          setUploadState(true, {
+            kind: "chart",
+            token,
+            badge: "Uploading…",
+            title: "Uploading claim chart…",
+            fileName,
+            detail: isHeavy ? "PDFs and images may take up to a minute" : "Parsing rows and assessing strength",
+          });
+          clearUploadStepTimeouts();
+          const steps = [
+            [2500, "Parsing claim chart rows…", ""],
+            [8000, "Assessing row strength with AI…", "This step can take a while on first upload"],
+            [20000, "Still processing…", "Large charts keep working — hang tight"],
+          ];
+          for (const [delay, title, detail] of steps) {
+            uploadStepTimeouts.push(
+              setTimeout(() => {
+                if (!ui.upload.active || ui.upload.token !== token || ui.upload.kind !== "chart") return;
+                setUploadState(true, { kind: "chart", token, badge: title, title, fileName, detail });
+              }, delay)
+            );
+          }
+          return token;
+        }
+
+        function beginDocUpload(fileName, kind = "doc") {
+          const title = kind === "url" ? "Capturing page from URL…" : "Uploading technical document…";
+          setUploadState(true, {
+            kind,
+            badge: kind === "url" ? "Capturing…" : "Uploading…",
+            title,
+            fileName: kind === "url" ? "" : fileName,
+            detail: kind === "url" ? fileName : "Extracting text for Spark context",
+          });
+        }
+
+        function endUploadState() {
+          setUploadState(false);
+        }
+
         function syncToolbarEnabled() {
-          const on = Boolean(state.activeChartId);
+          const on = Boolean(state.activeChartId) && !ui.upload.active;
           if (el.rowSearchInput) el.rowSearchInput.disabled = !on;
           if (el.reassessStrengthsBtn) el.reassessStrengthsBtn.disabled = !on;
+          if (el.chartSelect) el.chartSelect.disabled = !Boolean(state.activeChartId) || ui.upload.active;
         }
 
         function renderPendingBar() {
@@ -1662,9 +1816,28 @@
           el.docPreviewBody.textContent = d.extracted_preview || "(No extracted text — re-upload or try a different format.)";
         }
 
-        function toast(msg) {
+        function toast(msg, delay = 2200) {
           el.toastBody.textContent = msg;
-          bootstrap.Toast.getOrCreateInstance(el.toast, { delay: 2200 }).show();
+          bootstrap.Toast.getOrCreateInstance(el.toast, { delay }).show();
+        }
+
+        function applyStrengthJudgments(judgments) {
+          if (!judgments || !judgments.length) return;
+          judgments.forEach((j) => {
+            if (j.row_id && j.message) ui.strengthJudgmentHints[j.row_id] = j.message;
+          });
+          const unchanged = judgments.filter((j) => j.unchanged);
+          const improved = judgments.filter((j) => j.improved);
+          if (unchanged.length === 1) {
+            toast(unchanged[0].message, 5200);
+          } else if (unchanged.length > 1) {
+            toast(
+              `${unchanged.length} rows still Weak/Missing after your edit — AI judgment, not a failed save. Hover the row badge for detail.`,
+              5200
+            );
+          } else if (improved.length) {
+            toast(improved[0].message, 3200);
+          }
         }
 
         function strengthTitle(strength) {
@@ -2004,6 +2177,17 @@
           renderPendingBar();
           syncToolbarEnabled();
 
+          if (ui.upload.active && ui.upload.kind === "chart") {
+            el.rowCountBadge.textContent = "Processing…";
+            el.claimTbody.innerHTML = `<tr><td colspan="3" class="upload-table-placeholder">
+              <div class="upload-table-placeholder-inner">
+                <span class="spinner-border spinner-border-sm text-primary" role="status" aria-hidden="true"></span>
+                <span>${escapeHtml(ui.upload.title || "Uploading claim chart…")}</span>
+              </div>
+            </td></tr>`;
+            return;
+          }
+
           if (!state.activeChartId) {
             el.rowCountBadge.textContent = "0 rows";
             el.claimTbody.innerHTML = `<tr><td colspan="3" class="text-muted">Upload a claim chart to begin.</td></tr>`;
@@ -2070,13 +2254,18 @@
             };
 
             const st = r.strength || "weak";
+            const judgmentHint = ui.strengthJudgmentHints[r.id] || "";
+            const strengthHintTitle = judgmentHint
+              ? `${strengthTitle(st)} — ${judgmentHint}`
+              : `Evidence strength: ${strengthTitle(st)}`;
+            const strengthHintClass = judgmentHint ? " has-judgment-hint" : "";
             tr.innerHTML = `
               <td style="position:relative;">
                 <span class="strength-rail"></span>
                 <div class="row-meta">
                   <div class="row-meta-badges">
                     <span class="row-origin-mini ${originClass}" title="${escapeHtml(originTitle(origin))}">${escapeHtml(originAbbrev(origin))}</span>
-                    <span class="row-strength-mini" title="Evidence strength: ${escapeHtml(strengthTitle(st))}"><span class="dot"></span>${escapeHtml(strengthAbbrev(st))}</span>
+                    <span class="row-strength-mini${strengthHintClass}" title="${escapeHtml(strengthHintTitle)}"><span class="dot"></span>${escapeHtml(strengthAbbrev(st))}</span>
                   </div>
                   <div class="row-meta-tools">
                     <button type="button" class="btn row-edit-btn" data-edit-row="${r.id}" title="Edit row"><i class="bi bi-pencil-square" aria-hidden="true"></i></button>
@@ -2345,6 +2534,8 @@
 
           if (data.highlight_row_id) setActiveRow(Number(data.highlight_row_id));
 
+          applyStrengthJudgments(data.strength_judgments || []);
+
           const hints = data.client_hints || [];
           hints.forEach(async (h) => {
             if (h.type === "create_case" && h.case_id) {
@@ -2427,6 +2618,7 @@
               });
               if (!data.ok) return false;
               state.activeChart = data.claim_chart;
+              applyStrengthJudgments(data.strength_judgments || []);
               ui.pendingSuggestions = ui.pendingSuggestions.filter(
                 (s) => !matching.some((m) => m.row_id === s.row_id && m.field === s.field)
               );
@@ -2483,6 +2675,7 @@
           });
           if (!data.ok) return toast("Failed to apply suggestions");
           state.activeChart = data.claim_chart;
+          applyStrengthJudgments(data.strength_judgments || []);
           clearPendingSuggestion();
           toast(`✓ ${data.applied || batch.length} change(s) accepted`);
           renderTable();
@@ -2554,6 +2747,7 @@
           el.systemInstructions.value = state.activeChart.system_instructions || "";
           ui.pendingNewRows = [];
           ui.activeRowId = null;
+          ui.strengthJudgmentHints = {};
           el.chatInput.value = "";
           autoExpandTextarea(el.chatInput);
           clearPendingSuggestion();
@@ -2573,12 +2767,14 @@
           apiPostJson(`/api/claim-charts/${state.activeChartId}/suggestions/apply`, { suggestion: s }).then((data) => {
             if (!data.ok) return toast("Failed to apply suggestion");
             state.activeChart = data.claim_chart;
+            applyStrengthJudgments(data.strength_judgments || []);
             ui.pendingSuggestions = ui.pendingSuggestions.filter(
               (x) => !(x.row_id === s.row_id && x.field === s.field)
             );
             if (!ui.pendingSuggestions.length) ui.activeRowId = null;
             setActiveRow(s.row_id);
-            toast("✓ Change accepted");
+            const hadJudgment = (data.strength_judgments || []).some((j) => j.message);
+            if (!hadJudgment) toast("✓ Change accepted");
             renderTable();
             renderChat();
             syncUndoRedoButtons();
@@ -2658,6 +2854,7 @@
           apiPostJson(`/api/claim-charts/${state.activeChartId}/rows/update`, payload).then((data) => {
             if (!data.ok) return toast("Save failed");
             state.activeChart = data.claim_chart;
+            applyStrengthJudgments(data.strength_judgments || []);
             rowEditModalBs().hide();
             renderTable();
             syncUndoRedoButtons();
@@ -2961,6 +3158,7 @@
             ui.pendingUrlChartId = null;
             if (!cid) return toast("Select which claim chart this URL supports (⇄ in Docs).");
             el.saveProductUrlBtn.disabled = true;
+            beginDocUpload(trimmed, "url");
             try {
               const data = await apiPostJson("/api/product-docs/from-url", {
                 case_id: c.id,
@@ -2973,6 +3171,7 @@
               toast("Page captured — Spark will use it in chat for that chart.");
             } finally {
               el.saveProductUrlBtn.disabled = false;
+              endUploadState();
             }
           });
           el.attachInstructionsBtn.addEventListener("click", () => {
@@ -3015,13 +3214,18 @@
             fd.append("claim_chart_id", String(targetChart));
             fd.append("file", f);
             (async () => {
-              const data = await apiPostFormData("/api/product-docs/upload", fd);
-              el.docFileInput.value = "";
-              if (!data.ok) return;
-              await refreshCases();
-              const chart = (getActiveCase().claim_charts || []).find((x) => x.id === targetChart);
-              const label = chart ? chart.name : `chart #${targetChart}`;
-              toast(`Technical document linked to “${label}” — Spark will use it in chat for that chart.`);
+              beginDocUpload(f.name, "doc");
+              try {
+                const data = await apiPostFormData("/api/product-docs/upload", fd);
+                if (!data.ok) return;
+                await refreshCases();
+                const chart = (getActiveCase().claim_charts || []).find((x) => x.id === targetChart);
+                const label = chart ? chart.name : `chart #${targetChart}`;
+                toast(`Technical document linked to “${label}” — Spark will use it in chat for that chart.`);
+              } finally {
+                el.docFileInput.value = "";
+                endUploadState();
+              }
             })();
           });
 
@@ -3035,15 +3239,20 @@
                 el.chartFileInput.value = "";
                 return;
               }
-              const fd = new FormData();
-              fd.append("case_id", String(c.id));
-              fd.append("file", f);
-              const data = await apiPostFormData("/api/claim-charts/upload", fd);
-              el.chartFileInput.value = "";
-              if (!data || !data.ok) return;
-              await refreshCases();
-              await loadChart(data.claim_chart.id);
-              toast("Claim chart uploaded");
+              beginChartUpload(f.name);
+              try {
+                const fd = new FormData();
+                fd.append("case_id", String(c.id));
+                fd.append("file", f);
+                const data = await apiPostFormData("/api/claim-charts/upload", fd);
+                if (!data || !data.ok) return;
+                await refreshCases();
+                await loadChart(data.claim_chart.id);
+                toast("Claim chart uploaded");
+              } finally {
+                el.chartFileInput.value = "";
+                endUploadState();
+              }
             })();
           });
 
