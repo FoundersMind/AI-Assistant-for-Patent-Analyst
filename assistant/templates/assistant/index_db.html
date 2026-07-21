@@ -937,7 +937,7 @@
           <div class="chat-chrome-min">
             <div class="chat-chrome-min-inner">
               <span class="chat-brand-compact">Lumenci Spark</span>
-              <span class="chat-chrome-meta d-none d-lg-inline">Matter copilot</span>
+              <span class="chat-chrome-meta d-none d-lg-inline">Agent copilot — chat controls the workspace</span>
               <button
                 type="button"
                 class="btn btn-sm btn-outline-secondary workspace-expand-btn collapsed ms-auto"
@@ -1293,8 +1293,7 @@
             <ol class="small mb-0 ps-3">
               <li class="mb-2"><strong>Create a matter</strong> and upload a claim chart with <strong>+</strong>.</li>
               <li class="mb-2"><strong>Attach technical docs</strong> under Docs for richer AI context.</li>
-              <li class="mb-2">Ask Spark to <strong>strengthen weak rows</strong> — review before/after cards.</li>
-              <li class="mb-2"><strong>Accept or reject</strong> in chat or the chart grid (use <strong>Accept all</strong> for batches).</li>
+              <li class="mb-2">Ask Spark to refine the chart — say <strong>accept all</strong> or <strong>undo</strong> in chat; the <strong>agent runs actions for you</strong>.</li>
               <li><strong>Export</strong> to Word, Excel, or CSV when ready.</li>
             </ol>
           </div>
@@ -2304,36 +2303,85 @@
           return ui.pendingSuggestions;
         }
 
-        function handleWorkspaceCommandResponse(data) {
-          const cmd = data.workspace_command;
-          if (!cmd) return;
-          if (!ui.pendingSuggestions.length && !ui.pendingNewRows.length) {
-            recoverPendingFromChatHistory();
-          }
+        function handleAgentResponse(data) {
+          state.activeChart = data.claim_chart || state.activeChart;
+          el.systemInstructions.value = (state.activeChart && state.activeChart.system_instructions) || "";
+
           if (data.clear_pending) {
-            ui.pendingSuggestions = [];
-            ui.pendingNewRows = [];
-          } else if (cmd.type === "reject_row") {
-            ui.pendingSuggestions = ui.pendingSuggestions.filter(
-              (s) => !(s.row_id === cmd.row_id && (!cmd.field || s.field === cmd.field))
-            );
-            if (!ui.pendingSuggestions.length) ui.activeRowId = null;
-          } else if (cmd.type === "reject_all") {
             ui.pendingSuggestions = [];
             ui.pendingNewRows = [];
             ui.activeRowId = null;
           }
+
+          const suggestions = data.suggestions || [];
+          const newRows = data.new_rows || [];
+          if (suggestions.length) {
+            ui.pendingSuggestions = suggestions.map((s) => ({
+              row_id: Number(s.row_id),
+              field: s.field,
+              old_text: s.old_text,
+              new_text: s.new_text,
+            }));
+          } else if (data.clear_pending) {
+            ui.pendingSuggestions = [];
+          }
+
+          if (newRows.length) {
+            ui.pendingNewRows = newRows.map((x) => ({
+              claim: x.claim || "",
+              evidence: x.evidence || "",
+              reasoning: x.reasoning || "",
+            }));
+          } else if (data.clear_pending) {
+            ui.pendingNewRows = [];
+          }
+
+          const cmd = data.workspace_command;
+          if (cmd && cmd.type === "reject_row") {
+            ui.pendingSuggestions = ui.pendingSuggestions.filter(
+              (s) => !(s.row_id === cmd.row_id && (!cmd.field || s.field === cmd.field))
+            );
+          }
+
+          if (data.highlight_row_id) setActiveRow(Number(data.highlight_row_id));
+
+          const hints = data.client_hints || [];
+          hints.forEach(async (h) => {
+            if (h.type === "create_case" && h.case_id) {
+              await refreshCases();
+              state.activeCaseId = h.case_id;
+              state.activeChartId = null;
+              state.activeChart = null;
+              renderCaseSelect();
+              renderDocs();
+              toast(`Matter “${h.name || "New Case"}” created`);
+            }
+          });
+
           renderTable();
           renderChat();
           syncUndoRedoButtons();
           refreshChangeLog();
           renderAdminPanel();
-          if (cmd.type === "accept_all" && cmd.applied) toast(`✓ ${cmd.applied} change(s) accepted`);
-          else if (cmd.type === "accept_row" && cmd.applied) toast(`✓ Row ${cmd.row_id} updated`);
-          else if (cmd.type === "reject_all") toast("✗ Suggestions dismissed");
-          else if (cmd.type === "undo") toast("↩ Undone");
-          else if (cmd.type === "redo") toast("↪ Redone");
-          else if (cmd.type === "reassess_strengths") toast("Strength badges updated");
+          renderPendingBar();
+
+          const executed = data.executed_actions || [];
+          if (executed.length) {
+            const applied = executed.filter((e) => e.ok !== false && (e.applied || e.type === "undo" || e.type === "redo"));
+            if (applied.length) {
+              const labels = applied.map((e) => e.type.replace(/_/g, " ")).join(", ");
+              toast(`Agent executed: ${labels}`);
+            }
+          } else if (cmd) {
+            if (cmd.type === "accept_all" && cmd.applied) toast(`✓ ${cmd.applied} change(s) accepted`);
+            else if (cmd.type === "reject_all") toast("✗ Suggestions dismissed");
+            else if (cmd.type === "undo") toast("↩ Undone");
+            else if (cmd.type === "redo") toast("↪ Redone");
+          }
+        }
+
+        function handleWorkspaceCommandResponse(data) {
+          handleAgentResponse(data);
         }
 
         async function tryLocalChatCommand(msg) {
@@ -2640,14 +2688,6 @@
           if (!msg) return;
           if (!state.activeChartId) return toast("Upload/select a claim chart first");
 
-          if (await tryLocalChatCommand(msg)) {
-            const chat = [...(state.activeChart.chat || [])];
-            chat.push({ role: "user", content: msg, ts: Date.now() });
-            state.activeChart.chat = chat;
-            renderChat();
-            return;
-          }
-
           maybeHighlightFromText(msg);
           showTyping(false);
           if (ui.typingTimer) clearTimeout(ui.typingTimer);
@@ -2663,18 +2703,7 @@
             showTyping(false);
             if (ui.typingTimer) clearTimeout(ui.typingTimer);
 
-            state.activeChart = data.claim_chart || state.activeChart;
-            syncUndoRedoButtons();
-            refreshChangeLog();
-            renderAdminPanel();
-
-            if (data.workspace_command) {
-              handleWorkspaceCommandResponse(data);
-              renderChat();
-              return;
-            }
-
-            renderChat();
+            handleAgentResponse(data);
 
             const sg = data.strength_gate;
             if (sg && sg.removed_count > 0) {
@@ -2690,76 +2719,7 @@
 
             const suggestions = data.suggestions || [];
             const assistantText = data.assistant || "—";
-
-            let assistantWithCard = assistantText;
-            if (suggestions.length) {
-              const lines = suggestions.map((s) => {
-                const lab =
-                  s.field === "claim"
-                    ? "claim element"
-                    : s.field === "evidence"
-                      ? "evidence"
-                      : "reasoning";
-                return `• Row **${s.row_id}** (${lab})`;
-              });
-              assistantWithCard =
-                assistantText +
-                "\n\n**Suggested edits** — say **accept all**, **accept row N**, or **reject all**, or use the buttons on each card.\n" +
-                lines.join("\n") +
-                "\n" +
-                LUMENCI_SUG_START +
-                encodeURIComponent(JSON.stringify({ suggestions })) +
-                LUMENCI_SUG_END;
-            }
-            const newRows = Array.isArray(data.new_rows) ? data.new_rows : [];
-            if (newRows.length) {
-              assistantWithCard +=
-                "\n\n**Proposed new row(s)** — shown at the bottom of the claim chart with a **Proposed new** tag. " +
-                "Click **Accept (add row)** or say **accept new row** to insert them permanently as **Added** (distinct from **Original** upload rows).";
-              ui.pendingNewRows = newRows.map((x) => ({
-                claim: x.claim || "",
-                evidence: x.evidence || "",
-                reasoning: x.reasoning || "",
-              }));
-              renderTable();
-            } else {
-              ui.pendingNewRows = [];
-              renderTable();
-            }
-
-            const chat = [...(state.activeChart.chat || [])];
-            const last = chat.length ? chat[chat.length - 1] : null;
-            if (last && last.role === "assistant") {
-              chat[chat.length - 1] = { ...last, content: assistantWithCard };
-            } else {
-              chat.push({ role: "assistant", content: assistantWithCard, ts: Date.now() });
-            }
-            state.activeChart.chat = chat;
-            renderChat();
-            maybeHighlightFromText(assistantWithCard);
-
-            if (suggestions.length) {
-              ui.pendingSuggestions = suggestions.map((s) => ({
-                row_id: Number(s.row_id),
-                field: s.field,
-                old_text: s.old_text,
-                new_text: s.new_text,
-              }));
-              renderPendingBar();
-              setActiveRow(ui.pendingSuggestions[0].row_id);
-              if (userWantsApplyViaChat(msg)) {
-                if (suggestions.length === 1) {
-                  applySuggestion({
-                    row_id: Number(suggestions[0].row_id),
-                    field: suggestions[0].field,
-                    old_text: suggestions[0].old_text,
-                    new_text: suggestions[0].new_text,
-                  });
-                } else {
-                  acceptAllSuggestions();
-                }
-              }
-            }
+            maybeHighlightFromText(assistantText);
           } catch {
             showTyping(false);
             if (ui.typingTimer) clearTimeout(ui.typingTimer);
